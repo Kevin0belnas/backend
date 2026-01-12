@@ -53,22 +53,29 @@ app.use(session({
 
 /*
 |--------------------------------------------------------------------------
-| CORS CONFIGURATION
+| CORS CONFIGURATION - UPDATED FOR NEW BACKEND DOMAIN
 |--------------------------------------------------------------------------
 | DEV:
 |   - localhost / LAN IPs
 |
 | PROD:
-|   - https://fulfill1st.com ONLY
+|   - https://fulfill1st.com (frontend)
+|   - https://backend.fulfill1st.com (backend itself)
 */
 app.use(cors({
   origin: [
     'http://192.168.68.13:5177', // DEV (LAN)
     'http://localhost:5177',     // DEV (local)
-    'https://fulfill1st.com'     // PROD
+    'https://fulfill1st.com',    // PROD Frontend
+    'https://backend.fulfill1st.com' // PROD Backend (for self-calls if needed)
   ],
-  credentials: true
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
 }));
+
+// Handle preflight requests
+app.options('*', cors());
 
 app.use(express.json());
 
@@ -92,6 +99,40 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 /*
 |--------------------------------------------------------------------------
+| ADD DEBUG ENDPOINTS FOR TESTING
+|--------------------------------------------------------------------------
+*/
+// Health check endpoint
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'OK',
+    server: 'Fulfill1st Backend',
+    domain: 'backend.fulfill1st.com',
+    port: PORT,
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV || 'development'
+  });
+});
+
+// Simple test endpoint
+app.get('/api/test', (req, res) => {
+  res.json({
+    success: true,
+    message: 'Backend is working!',
+    backendDomain: 'backend.fulfill1st.com',
+    allowedOrigins: ['https://fulfill1st.com'],
+    cors: 'enabled'
+  });
+});
+
+// Log requests for debugging
+app.use((req, res, next) => {
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.url} - Origin: ${req.headers.origin || 'none'}`);
+  next();
+});
+
+/*
+|--------------------------------------------------------------------------
 | API ROUTES
 |--------------------------------------------------------------------------
 | DEV & PROD:
@@ -101,23 +142,37 @@ app.use('/api', routes);
 
 /*
 |--------------------------------------------------------------------------
-| FRONTEND SERVING
+| ROOT ENDPOINT
 |--------------------------------------------------------------------------
-| DEV:
-|   ❌ Not used (Vite runs separately)
-|
-| PROD:
-|   ❌ NOT USED because frontend (dist) is already uploaded to Hostinger
-|   (Kept here for reference only)
-|
-| Uncomment ONLY if you decide to serve React from Express in the future
 */
-// if (process.env.NODE_ENV === 'production') {
-//   app.use(express.static(path.join(__dirname, '../frontend/build')));
-//   app.get('*', (req, res) => {
-//     res.sendFile(path.join(__dirname, '../frontend/build', 'index.html'));
-//   });
-// }
+app.get('/', (req, res) => {
+  res.json({
+    message: 'Fulfill1st Backend API',
+    domain: 'backend.fulfill1st.com',
+    status: 'running',
+    endpoints: {
+      health: '/api/health',
+      test: '/api/test',
+      bookstores: '/api/bookstores'
+    },
+    frontend: 'https://fulfill1st.com'
+  });
+});
+
+/*
+|--------------------------------------------------------------------------
+| 404 HANDLER
+|--------------------------------------------------------------------------
+*/
+app.use((req, res) => {
+  res.status(404).json({
+    error: 'Route not found',
+    path: req.url,
+    method: req.method,
+    backend: 'backend.fulfill1st.com',
+    suggestion: 'Try /api/health or /api/test'
+  });
+});
 
 /*
 |--------------------------------------------------------------------------
@@ -131,8 +186,35 @@ app.use('/api', routes);
 */
 app.listen(PORT, '0.0.0.0', () => {
   if (process.env.NODE_ENV === 'production') {
-    console.log('Backend running on fulfill1st.com');
+    console.log(`
+===========================================
+🚀 BACKEND SERVER RUNNING
+===========================================
+Domain: https://backend.fulfill1st.com
+Port: ${PORT}
+Environment: production
+
+Frontend: https://fulfill1st.com
+API Base: https://backend.fulfill1st.com/api
+
+Test endpoints:
+1. https://backend.fulfill1st.com/api/health
+2. https://backend.fulfill1st.com/api/test
+3. https://backend.fulfill1st.com/api/bookstores
+===========================================
+`);
   } else {
-    console.log(`DEV server running on http://localhost:${PORT}`);
+    console.log(`
+===========================================
+🚀 DEV SERVER RUNNING
+===========================================
+Local: http://localhost:${PORT}
+API Base: http://localhost:${PORT}/api
+
+Test endpoints:
+1. http://localhost:${PORT}/api/health
+2. http://localhost:${PORT}/api/test
+===========================================
+`);
   }
 });
