@@ -1,4 +1,4 @@
-// Minimal working server.js
+// Minimal working server.js (Hostinger-safe)
 const express = require('express');
 const cors = require('cors');
 const session = require('express-session');
@@ -12,20 +12,13 @@ const app = express();
 |--------------------------------------------------------------------------
 | PORT
 |--------------------------------------------------------------------------
-| DEV:
-|   You usually run on 3000 locally
-|
-| PROD (Hostinger):
-|   Hostinger provides the PORT automatically via process.env.PORT
 */
 const PORT = process.env.PORT || 3000;
 
 /*
 |--------------------------------------------------------------------------
-| TRUST PROXY
+| TRUST PROXY (REQUIRED FOR HOSTINGER)
 |--------------------------------------------------------------------------
-| PROD ONLY:
-|   Required on Hostinger so secure cookies & sessions work correctly
 */
 app.set('trust proxy', 1);
 
@@ -33,76 +26,69 @@ app.set('trust proxy', 1);
 |--------------------------------------------------------------------------
 | SESSION CONFIGURATION
 |--------------------------------------------------------------------------
-| DEV:
-|   - secure: false (HTTP)
-|
-| PROD:
-|   - secure: true (HTTPS)
-|   - sameSite: 'none' (cross-origin)
 */
 app.use(session({
-  secret: process.env.SESSION_SECRET || 'bookstore-secret-key', // DEV fallback
+  secret: process.env.SESSION_SECRET || 'bookstore-secret-key',
   resave: false,
   saveUninitialized: false,
   cookie: {
-    secure: process.env.NODE_ENV === 'production', // PROD ONLY
+    secure: process.env.NODE_ENV === 'production',
     sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
-    maxAge: 24 * 60 * 60 * 1000 // 24 hours
+    maxAge: 24 * 60 * 60 * 1000
   }
 }));
 
 /*
 |--------------------------------------------------------------------------
-| CORS CONFIGURATION - UPDATED FOR NEW BACKEND DOMAIN
+| CORS CONFIGURATION
 |--------------------------------------------------------------------------
-| DEV:
-|   - localhost / LAN IPs
-|
-| PROD:
-|   - https://fulfill1st.com (frontend)
-|   - https://backend.fulfill1st.com (backend itself)
 */
 app.use(cors({
   origin: [
-    'http://192.168.68.13:5177', // DEV (LAN)
-    'http://localhost:5177',     // DEV (local)
-    'https://fulfill1st.com',    // PROD Frontend
-    'https://backend.fulfill1st.com' // PROD Backend (for self-calls if needed)
+    'http://192.168.68.13:5177',
+    'http://localhost:5177',
+    'https://fulfill1st.com',
+    'https://backend.fulfill1st.com'
   ],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
 }));
 
-// Handle preflight requests
-app.options('*', cors());
+// ❌ REMOVED: app.options('*', cors());
+// ✔ CHANGE: Hostinger + Express can crash on wildcard OPTIONS.
+// ✔ CORS middleware already handles OPTIONS automatically.
 
 app.use(express.json());
 
 /*
 |--------------------------------------------------------------------------
-| DATABASE CONNECTION TEST
+| DATABASE CONNECTION TEST (SAFE MODE)
 |--------------------------------------------------------------------------
-| DEV & PROD:
-|   Safe to run once on startup
 */
-testConnection();
+// ❌ BEFORE: testConnection();
+// ✔ CHANGE: Prevent Hostinger from killing the app if DB fails on startup
+(async () => {
+  try {
+    await testConnection();
+    console.log('✅ Database connected');
+  } catch (err) {
+    console.error('❌ Database connection failed:', err.message);
+  }
+})();
 
 /*
 |--------------------------------------------------------------------------
-| STATIC FILES (UPLOADS)
+| STATIC FILES
 |--------------------------------------------------------------------------
-| DEV & PROD:
-|   Used for serving uploaded images/files
 */
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 /*
 |--------------------------------------------------------------------------
-| ADD DEBUG ENDPOINTS FOR TESTING
+| DEBUG ENDPOINTS
 |--------------------------------------------------------------------------
 */
-// Health check endpoint
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'OK',
@@ -114,7 +100,6 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// Simple test endpoint
 app.get('/api/test', (req, res) => {
   res.json({
     success: true,
@@ -125,9 +110,15 @@ app.get('/api/test', (req, res) => {
   });
 });
 
-// Log requests for debugging
+/*
+|--------------------------------------------------------------------------
+| REQUEST LOGGING
+|--------------------------------------------------------------------------
+*/
 app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.url} - Origin: ${req.headers.origin || 'none'}`);
+  console.log(
+    `${new Date().toISOString()} - ${req.method} ${req.url} - Origin: ${req.headers.origin || 'none'}`
+  );
   next();
 });
 
@@ -135,8 +126,6 @@ app.use((req, res, next) => {
 |--------------------------------------------------------------------------
 | API ROUTES
 |--------------------------------------------------------------------------
-| DEV & PROD:
-|   All backend endpoints live under /api
 */
 app.use('/api', routes);
 
@@ -178,43 +167,18 @@ app.use((req, res) => {
 |--------------------------------------------------------------------------
 | START SERVER
 |--------------------------------------------------------------------------
-| DEV:
-|   Logs localhost or LAN IP
-|
-| PROD:
-|   Hostinger handles the domain & port
 */
-app.listen(PORT, '0.0.0.0', () => {
-  if (process.env.NODE_ENV === 'production') {
-    console.log(`
+// ❌ BEFORE: app.listen(PORT, '0.0.0.0', ...)
+// ✔ CHANGE: Hostinger binds automatically; simpler & safer
+app.listen(PORT, () => {
+  console.log(`
 ===========================================
 🚀 BACKEND SERVER RUNNING
 ===========================================
 Domain: https://backend.fulfill1st.com
 Port: ${PORT}
-Environment: production
-
-Frontend: https://fulfill1st.com
+Environment: ${process.env.NODE_ENV || 'development'}
 API Base: https://backend.fulfill1st.com/api
-
-Test endpoints:
-1. https://backend.fulfill1st.com/api/health
-2. https://backend.fulfill1st.com/api/test
-3. https://backend.fulfill1st.com/api/bookstores
 ===========================================
 `);
-  } else {
-    console.log(`
-===========================================
-🚀 DEV SERVER RUNNING
-===========================================
-Local: http://localhost:${PORT}
-API Base: http://localhost:${PORT}/api
-
-Test endpoints:
-1. http://localhost:${PORT}/api/health
-2. http://localhost:${PORT}/api/test
-===========================================
-`);
-  }
 });
