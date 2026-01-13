@@ -48,7 +48,7 @@ app.use(cors({
     'http://192.168.68.13:5177',
     'http://localhost:5177',
     'https://fulfill1st.com',
-    'https://backend.fulfill1st.com'
+    'https://api.fulfill1st.com'
   ],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
