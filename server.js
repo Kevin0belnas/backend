@@ -310,6 +310,56 @@ app.get('/api/test', (req, res) => {
   });
 });
 
+// Add this after your existing /api/test endpoint
+app.get('/api/db-test', async (req, res) => {
+  console.log('🔍 Testing database connection...');
+  
+  try {
+    // Test 1: Basic connection
+    const connection = await pool.getConnection();
+    console.log('✅ Database connection established');
+    
+    // Test 2: Simple query
+    const [result] = await connection.query('SELECT 1 + 1 as solution');
+    console.log('✅ Simple query executed:', result);
+    
+    // Test 3: Check if bookstores table exists
+    const [tables] = await connection.query(
+      "SHOW TABLES LIKE 'bookstores'"
+    );
+    
+    connection.release();
+    
+    res.json({
+      success: true,
+      message: 'Database connection successful',
+      database: {
+        connection: 'OK',
+        simpleQuery: result[0].solution === 2 ? 'OK' : 'FAILED',
+        bookstoresTableExists: tables.length > 0,
+        tablesFound: tables
+      },
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    console.error('❌ Database test failed:', error.message);
+    
+    res.status(500).json({
+      success: false,
+      error: 'Database connection failed',
+      details: {
+        message: error.message,
+        code: error.code,
+        errno: error.errno,
+        sqlState: error.sqlState
+      },
+      suggestion: 'Check database credentials and connection',
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
 /*
 |--------------------------------------------------------------------------
 | REQUEST LOGGING
