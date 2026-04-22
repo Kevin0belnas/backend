@@ -1,10 +1,13 @@
 const express = require('express');
 const cors = require('cors');
 const session = require('express-session');
-const { pool, testConnection } = require('./db');
+const { pool, testConnection, ensureConnection, parseDateForMySQL } = require('./db');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const jwt = require('jsonwebtoken');
+
+const JWT_SECRET = process.env.JWT_SECRET || 'your-super-secret-jwt-key-change-this-in-production-2024';
 
 const app = express();
 
@@ -50,7 +53,7 @@ const corsOptions = {
     if (!origin && isDevelopment) return callback(null, true);
     
     const allowedOrigins = [
-      'http://192.168.68.4:5177', // Your LAN IP for development
+      'http://192.168.68.78:5177', // Your LAN IP for development
       'http://localhost:5177',     // Localhost for development
       'http://localhost:5173',     // Additional local port
       'http://127.0.0.1:5177',     // Localhost IP
@@ -197,7 +200,7 @@ app.get('/api/health', (req, res) => {
     timestamp: new Date().toISOString(),
     environment: process.env.NODE_ENV || 'development',
     mode: isDevelopment ? 'Development' : 'Production',
-    frontend: 'http://192.168.68.4:5177'
+    frontend: 'http://192.168.68.78:5177'
   });
 });
 
@@ -207,7 +210,7 @@ app.get('/api/test', (req, res) => {
     message: 'Backend is working!',
     mode: isDevelopment ? 'Development' : 'Production',
     allowedOrigins: [
-      'http://192.168.68.4:5177',
+      'http://192.168.68.78:5177',
       'http://localhost:5177',
       'http://localhost:5173'
     ],
@@ -2977,6 +2980,860 @@ app.get('/api/trad-publishers/search/:query', async (req, res) => {
   }
 });
 
+// Add this to your server.js file - Reviews API Routes
+
+// Get reviews for a service with pagination
+app.get('/api/reviews/:section/:serviceSlug', async (req, res) => {
+  try {
+    const { section, serviceSlug } = req.params;
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 3;
+    const offset = (page - 1) * limit;
+
+    // Get total count of reviews for this service
+    const [countResult] = await pool.query(
+      'SELECT COUNT(*) as total FROM service_reviews WHERE service_slug = ? AND section = ?',
+      [serviceSlug, section]
+    );
+
+    // Get paginated reviews ordered by most recent first
+    const [reviews] = await pool.query(
+      `SELECT id, name, rating, text, created_at 
+       FROM service_reviews 
+       WHERE service_slug = ? AND section = ? 
+       ORDER BY created_at DESC 
+       LIMIT ? OFFSET ?`,
+      [serviceSlug, section, limit, offset]
+    );
+
+    res.json({
+      success: true,
+      data: reviews,
+      pagination: {
+        currentPage: page,
+        totalPages: Math.ceil(countResult[0].total / limit),
+        totalItems: countResult[0].total,
+        itemsPerPage: limit
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching reviews:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Create a new review
+app.post('/api/reviews', async (req, res) => {
+  try {
+    const { service_slug, section, name, email, rating, text, recaptcha } = req.body;
+
+    // Validate required fields
+    if (!service_slug || !section || !name || !email) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Missing required fields' 
+      });
+    }
+
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Invalid email format' 
+      });
+    }
+
+    // Validate rating if provided
+    if (rating && (rating < 1 || rating > 5)) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Rating must be between 1 and 5' 
+      });
+    }
+
+    // Insert review into database
+    const [result] = await pool.query(
+      `INSERT INTO service_reviews (service_slug, section, name, email, rating, text) 
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [service_slug, section, name, email, rating || null, text || null]
+    );
+
+    res.json({
+      success: true,
+      message: 'Review submitted successfully',
+      data: {
+        id: result.insertId,
+        service_slug,
+        section,
+        name,
+        email,
+        rating,
+        text,
+        created_at: new Date().toISOString()
+      }
+    });
+  } catch (error) {
+    console.error('Error creating review:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Get average rating for a service
+app.get('/api/reviews/:section/:serviceSlug/average', async (req, res) => {
+  try {
+    const { section, serviceSlug } = req.params;
+
+    const [result] = await pool.query(
+      `SELECT 
+        COUNT(*) as total_reviews,
+        COALESCE(AVG(rating), 0) as average_rating,
+        COUNT(CASE WHEN rating IS NOT NULL THEN 1 END) as ratings_count
+       FROM service_reviews 
+       WHERE service_slug = ? AND section = ?`,
+      [serviceSlug, section]
+    );
+
+    res.json({
+      success: true,
+      data: {
+        total_reviews: result[0].total_reviews,
+        average_rating: parseFloat(result[0].average_rating) || 0,
+        ratings_count: result[0].ratings_count
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching average rating:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Delete a review (optional - admin only)
+app.delete('/api/reviews/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const [result] = await pool.query(
+      'DELETE FROM service_reviews WHERE id = ?',
+      [id]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Review not found' 
+      });
+    }
+
+    res.json({ 
+      success: true, 
+      message: 'Review deleted successfully' 
+    });
+  } catch (error) {
+    console.error('Error deleting review:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+
+const bcrypt = require('bcrypt');
+
+// ========== JWT AUTHENTICATION MIDDLEWARE ==========
+function authenticateToken(req, res, next) {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    
+    if (!token) {
+        return res.status(401).json({ success: false, error: 'Access token required' });
+    }
+    
+    jwt.verify(token, JWT_SECRET, (err, user) => {
+        if (err) {
+            return res.status(403).json({ success: false, error: 'Invalid or expired token' });
+        }
+        req.user = user;
+        next();
+    });
+}
+
+// ========== AUTHENTICATION ROUTES ==========
+
+// Login endpoint
+app.post('/api/auth/login', async (req, res) => {
+    try {
+        const { email, password } = req.body;
+
+        if (!email || !password) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Email and password are required' 
+            });
+        }
+
+        // Query the database for the user
+        const [users] = await pool.query(
+            'SELECT id, email, name, password_hash, role, is_active FROM agents WHERE email = ?',
+            [email]
+        );
+
+        if (users.length === 0) {
+            return res.status(401).json({ 
+                success: false, 
+                error: 'Invalid email or password' 
+            });
+        }
+
+        const user = users[0];
+
+        // Check if user is active
+        if (!user.is_active) {
+            return res.status(401).json({ 
+                success: false, 
+                error: 'Account is disabled. Please contact support.' 
+            });
+        }
+
+        // Compare password
+        const isValidPassword = await bcrypt.compare(password, user.password_hash);
+
+        if (!isValidPassword) {
+            return res.status(401).json({ 
+                success: false, 
+                error: 'Invalid email or password' 
+            });
+        }
+
+        // Update last login time
+        await pool.query(
+            'UPDATE agents SET last_login = NOW() WHERE id = ?',
+            [user.id]
+        );
+
+        // Generate JWT token
+        const token = jwt.sign(
+            { id: user.id, email: user.email, role: user.role },
+            JWT_SECRET,
+            { expiresIn: '24h' }
+        );
+
+        // Return success response
+        res.json({
+            success: true,
+            message: 'Login successful',
+            data: {
+                token: token,
+                user: {
+                    id: user.id,
+                    email: user.email,
+                    name: user.name,
+                    role: user.role
+                }
+            }
+        });
+
+    } catch (error) {
+        console.error('Login error:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: error.message 
+        });
+    }
+});
+
+// Register endpoint
+app.post('/api/auth/register', async (req, res) => {
+    try {
+        const { firstName, lastName, email, password, role } = req.body;
+
+        // Validate required fields
+        if (!firstName || !lastName || !email || !password) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'All fields are required' 
+            });
+        }
+
+        // Validate email format
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(email)) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Invalid email format' 
+            });
+        }
+
+        // Validate password length
+        if (password.length < 6) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Password must be at least 6 characters long' 
+            });
+        }
+
+        // Check if user already exists
+        const [existingUsers] = await pool.query(
+            'SELECT id FROM agents WHERE email = ?',
+            [email]
+        );
+
+        if (existingUsers.length > 0) {
+            return res.status(409).json({ 
+                success: false, 
+                error: 'Email already registered' 
+            });
+        }
+
+        // Hash the password
+        const saltRounds = 10;
+        const passwordHash = await bcrypt.hash(password, saltRounds);
+
+        // Insert the new agent
+        const [result] = await pool.query(
+            `INSERT INTO agents (email, name, first_name, last_name, password_hash, role, is_active) 
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [email, `${firstName} ${lastName}`, firstName, lastName, passwordHash, role || 'agent', true]
+        );
+
+        // Return success response
+        res.json({
+            success: true,
+            message: 'Account created successfully',
+            data: {
+                id: result.insertId,
+                email: email,
+                name: `${firstName} ${lastName}`,
+                role: role || 'agent'
+            }
+        });
+
+    } catch (error) {
+        console.error('Registration error:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: error.message 
+        });
+    }
+});
+
+// Get current user info (protected route)
+app.get('/api/auth/me', authenticateToken, async (req, res) => {
+    try {
+        const [users] = await pool.query(
+            'SELECT id, email, name, first_name, last_name, role, is_active, created_at FROM agents WHERE id = ?',
+            [req.user.id]
+        );
+        
+        if (users.length === 0) {
+            return res.status(404).json({ success: false, error: 'User not found' });
+        }
+        
+        res.json({ success: true, data: users[0] });
+    } catch (error) {
+        console.error('Error fetching user:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Logout endpoint - no authentication needed
+app.post('/api/auth/logout', (req, res) => {
+    // For JWT, logout is purely client-side
+    // Just return success
+    res.json({ success: true, message: 'Logged out successfully' });
+});
+
+
+
+
+
+
+
+
+
+// ========== AGENT CHAT ROUTES ==========
+
+// Get all conversations for agent
+app.get('/api/agent/conversations', authenticateToken, async (req, res) => {
+  try {
+    const agentId = req.user.id;
+    
+    // Check database connection
+    const isConnected = await ensureConnection();
+    if (!isConnected) {
+      return res.status(503).json({ 
+        success: false, 
+        error: 'Database connection unavailable' 
+      });
+    }
+    
+    // Get all visitors assigned to this agent
+    const [visitors] = await pool.query(
+      `SELECT v.id, v.email, v.name, v.topic, v.conversation_id, 
+              v.assigned_at, v.created_at, v.updated_at
+       FROM visitors v 
+       WHERE v.agent_id = ? 
+         AND (v.completed_at IS NULL OR v.completed_at = '0000-00-00 00:00:00' OR v.completed_at = '')
+       ORDER BY v.updated_at DESC`,
+      [agentId]
+    );
+    
+    const conversations = [];
+    
+    for (const visitor of visitors) {
+      // Get all messages for this visitor - ORDER BY created_at ASC (oldest first)
+      const [messages] = await pool.query(
+        `SELECT m.id, m.message, m.is_agent, m.agent_id, m.created_at, m.conversation_id,
+                a.name as agent_name
+         FROM visitor_messages m
+         LEFT JOIN agents a ON m.agent_id = a.id
+         WHERE m.visitor_email = ? AND m.conversation_id = ?
+         ORDER BY m.created_at ASC`,
+        [visitor.email, visitor.conversation_id]
+      );
+      
+      // Format messages with consistent timestamp format
+      const formattedMessages = messages.map(msg => ({
+        id: msg.id,
+        message: msg.message,
+        text: msg.message,
+        isAgent: msg.is_agent === 1,
+        timestamp: msg.created_at ? new Date(msg.created_at).toISOString() : new Date().toISOString(),
+        agent_id: msg.agent_id,
+        conversation_id: msg.conversation_id,
+        agent_name: msg.agent_name || (msg.is_agent ? 'Agent' : null)
+      }));
+      
+      // Calculate unread count
+      let unreadCount = 0;
+      const lastAgentMessage = [...formattedMessages].reverse().find(m => m.isAgent);
+      if (lastAgentMessage) {
+        unreadCount = formattedMessages.filter(m => 
+          !m.isAgent && new Date(m.timestamp) > new Date(lastAgentMessage.timestamp)
+        ).length;
+      } else {
+        unreadCount = formattedMessages.filter(m => !m.isAgent).length;
+      }
+      
+      const hasAgentResponded = formattedMessages.some(msg => msg.isAgent);
+      const hasClientMessages = formattedMessages.some(msg => !msg.isAgent);
+      
+      conversations.push({
+        id: visitor.id,
+        email: visitor.email,
+        name: visitor.name || visitor.email,
+        topic: visitor.topic,
+        chatKey: visitor.email,
+        conversation_id: visitor.conversation_id,
+        messages: formattedMessages,
+        last_message_at: messages.length > 0 ? messages[messages.length - 1].created_at : visitor.created_at,
+        needsWelcome: hasClientMessages && !hasAgentResponded,
+        unread_count: unreadCount
+      });
+    }
+    
+    conversations.sort((a, b) => new Date(b.last_message_at) - new Date(a.last_message_at));
+    
+    res.json({ success: true, data: conversations });
+  } catch (error) {
+    console.error('Error fetching conversations:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Send message as agent
+app.post('/api/agent/messages', authenticateToken, async (req, res) => {
+    const { visitor_email, message, conversation_id } = req.body;
+    const agentId = req.user.id;
+    
+    if (!visitor_email || !message || !conversation_id) {
+        return res.status(400).json({ 
+            success: false, 
+            error: 'Missing required fields: visitor_email, message, conversation_id'
+        });
+    }
+    
+    try {
+        // Get agent name
+        const [agent] = await pool.query(
+            'SELECT name FROM agents WHERE id = ?',
+            [agentId]
+        );
+        
+        // Insert message with MySQL NOW()
+        const [result] = await pool.query(
+            `INSERT INTO visitor_messages (visitor_email, message, is_agent, agent_id, created_at, conversation_id) 
+             VALUES (?, ?, 1, ?, NOW(), ?)`,
+            [visitor_email, message, agentId, conversation_id]
+        );
+        
+        // Get the created_at timestamp from MySQL
+        const [newMessage] = await pool.query(
+            'SELECT created_at FROM visitor_messages WHERE id = ?',
+            [result.insertId]
+        );
+        
+        // Update visitor's updated_at
+        await pool.query(
+            'UPDATE visitors SET updated_at = NOW() WHERE email = ? AND conversation_id = ?',
+            [visitor_email, conversation_id]
+        );
+        
+        // Return consistent timestamp format
+        const timestamp = new Date(newMessage[0].created_at).toISOString();
+        
+        res.json({
+            success: true,
+            data: {
+                id: result.insertId,
+                message: message,
+                is_agent: true,
+                agent_id: agentId,
+                agent_name: agent[0]?.name || 'Agent',
+                created_at: timestamp,
+                timestamp: timestamp,
+                conversation_id: conversation_id,
+                visitor_email: visitor_email
+            }
+        });
+    } catch (error) {
+        console.error('Error sending message:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Mark conversation as read
+app.post('/api/agent/conversations/:email/read', authenticateToken, async (req, res) => {
+    const { email } = req.params;
+    const agentId = req.user.id;
+    
+    try {
+        await pool.query(
+            `UPDATE visitors 
+             SET last_read_at = NOW(), updated_at = NOW() 
+             WHERE email = ? AND agent_id = ? AND completed_at IS NULL`,
+            [email, agentId]
+        );
+        
+        res.json({ success: true, message: 'Marked as read' });
+    } catch (error) {
+        console.error('Error marking as read:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ========== VISITOR CHAT ROUTES ==========
+
+// Get messages for a conversation
+app.get('/api/visitor/messages/:conversationId', async (req, res) => {
+  try {
+    const { conversationId } = req.params;
+    
+    const isConnected = await ensureConnection();
+    if (!isConnected) {
+      return res.status(503).json({ 
+        success: false, 
+        error: 'Database connection unavailable' 
+      });
+    }
+    
+    const [messages] = await pool.query(
+      `SELECT m.id, m.visitor_email, m.message, m.is_agent, m.agent_id, m.created_at, m.conversation_id,
+              a.name as agent_name
+       FROM visitor_messages m
+       LEFT JOIN agents a ON m.agent_id = a.id
+       WHERE m.conversation_id = ? 
+       ORDER BY m.created_at ASC`,
+      [conversationId]
+    );
+    
+    // Format messages with consistent timestamp
+    const formattedMessages = messages.map(msg => ({
+      id: msg.id,
+      visitor_email: msg.visitor_email,
+      message: msg.message,
+      is_agent: msg.is_agent === 1,
+      agent_id: msg.agent_id,
+      conversation_id: msg.conversation_id,
+      created_at: msg.created_at ? new Date(msg.created_at).toISOString() : new Date().toISOString(),
+      timestamp: msg.created_at ? new Date(msg.created_at).toISOString() : new Date().toISOString(),
+      agent_name: msg.agent_name
+    }));
+    
+    res.json({ success: true, data: formattedMessages });
+  } catch (error) {
+    console.error('Error fetching messages:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Create or update visitor
+app.post('/api/visitors', async (req, res) => {
+  try {
+    const { email, name, topic, conversation_id } = req.body;
+    
+    if (!email || !conversation_id) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Missing required fields: email, conversation_id' 
+      });
+    }
+    
+    const isConnected = await ensureConnection();
+    if (!isConnected) {
+      return res.status(503).json({ 
+        success: false, 
+        error: 'Database connection unavailable' 
+      });
+    }
+    
+    // Generate a default name from email if not provided
+    let visitorName = name;
+    if (!visitorName || visitorName === 'null' || visitorName === 'undefined') {
+      visitorName = email.split('@')[0] || 'Visitor';
+      visitorName = visitorName.replace(/[^a-zA-Z0-9]/g, ' ').trim();
+      if (visitorName.length === 0) visitorName = 'Visitor';
+      visitorName = visitorName.charAt(0).toUpperCase() + visitorName.slice(1);
+    }
+    
+    // Check if visitor exists with this conversation
+    const [existing] = await pool.query(
+      'SELECT id, agent_id, conversation_id FROM visitors WHERE email = ? AND conversation_id = ?',
+      [email, conversation_id]
+    );
+    
+    let visitorId;
+    if (existing.length > 0) {
+      // Update existing
+      await pool.query(
+        `UPDATE visitors 
+         SET topic = ?, name = ?, updated_at = NOW() 
+         WHERE email = ? AND conversation_id = ?`,
+        [topic || null, visitorName, email, conversation_id]
+      );
+      visitorId = existing[0].id;
+    } else {
+      // Insert new
+      const [result] = await pool.query(
+        `INSERT INTO visitors (email, name, topic, conversation_id, created_at, updated_at) 
+         VALUES (?, ?, ?, ?, NOW(), NOW())`,
+        [email, visitorName, topic || null, conversation_id]
+      );
+      visitorId = result.insertId;
+    }
+    
+    res.json({ 
+      success: true, 
+      data: { 
+        id: visitorId, 
+        email, 
+        name: visitorName, 
+        topic, 
+        conversation_id 
+      } 
+    });
+  } catch (error) {
+    console.error('Error creating/updating visitor:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Get visitor by email and conversation
+app.get('/api/visitors/:email', async (req, res) => {
+    try {
+        const { email } = req.params;
+        const { conversation_id } = req.query;
+        
+        let query = 'SELECT * FROM visitors WHERE email = ?';
+        const params = [decodeURIComponent(email)];
+        
+        if (conversation_id) {
+            query += ' AND conversation_id = ?';
+            params.push(conversation_id);
+        }
+        
+        query += ' ORDER BY created_at DESC LIMIT 1';
+        
+        const [visitors] = await pool.query(query, params);
+        
+        if (visitors.length === 0) {
+            return res.status(404).json({ success: false, error: 'Visitor not found' });
+        }
+        
+        // Format dates
+        const visitor = visitors[0];
+        if (visitor.created_at) visitor.created_at = new Date(visitor.created_at).toISOString();
+        if (visitor.updated_at) visitor.updated_at = new Date(visitor.updated_at).toISOString();
+        if (visitor.assigned_at) visitor.assigned_at = new Date(visitor.assigned_at).toISOString();
+        
+        res.json({ success: true, data: visitor });
+    } catch (error) {
+        console.error('Error fetching visitor:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Assign agent to visitor
+app.post('/api/visitors/assign-agent', async (req, res) => {
+    try {
+        const { email, topic, conversation_id } = req.body;
+        
+        if (!email || !conversation_id) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Missing required fields' 
+            });
+        }
+        
+        // Get available agents (least assigned)
+        const [agents] = await pool.query(
+            `SELECT a.*, COUNT(v.id) as assigned_count 
+             FROM agents a 
+             LEFT JOIN visitors v ON a.id = v.agent_id AND v.completed_at IS NULL 
+             WHERE a.role = 'agent' AND a.is_active = 1
+             GROUP BY a.id 
+             ORDER BY assigned_count ASC, a.last_assigned_at ASC 
+             LIMIT 1`,
+            []
+        );
+        
+        if (agents.length === 0) {
+            return res.status(404).json({ success: false, error: 'No agents available' });
+        }
+        
+        const assignedAgent = agents[0];
+        
+        // Check if visitor exists
+        const [existing] = await pool.query(
+            'SELECT id FROM visitors WHERE email = ? AND conversation_id = ?',
+            [email, conversation_id]
+        );
+        
+        if (existing.length > 0) {
+            // Update existing visitor with agent
+            await pool.query(
+                `UPDATE visitors 
+                 SET agent_id = ?, topic = ?, assigned_at = NOW(), updated_at = NOW() 
+                 WHERE email = ? AND conversation_id = ?`,
+                [assignedAgent.id, topic, email, conversation_id]
+            );
+        } else {
+            // Create new visitor with agent
+            await pool.query(
+                `INSERT INTO visitors (email, topic, conversation_id, agent_id, assigned_at, created_at, updated_at) 
+                 VALUES (?, ?, ?, ?, NOW(), NOW(), NOW())`,
+                [email, topic, conversation_id, assignedAgent.id]
+            );
+        }
+        
+        // Update agent's last assigned time
+        await pool.query(
+            'UPDATE agents SET last_assigned_at = NOW() WHERE id = ?',
+            [assignedAgent.id]
+        );
+        
+        res.json({ 
+            success: true, 
+            data: { 
+                agent: {
+                    id: assignedAgent.id,
+                    name: assignedAgent.name,
+                    email: assignedAgent.email
+                }
+            } 
+        });
+    } catch (error) {
+        console.error('Error assigning agent:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Save visitor message
+app.post('/api/visitor/messages', async (req, res) => {
+  try {
+    const { visitor_email, message, is_agent, agent_id, conversation_id } = req.body;
+    
+    if (!visitor_email || !message || !conversation_id) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Missing required fields: visitor_email, message, conversation_id' 
+      });
+    }
+    
+    const isConnected = await ensureConnection();
+    if (!isConnected) {
+      return res.status(503).json({ 
+        success: false, 
+        error: 'Database connection unavailable' 
+      });
+    }
+    
+    const [result] = await pool.query(
+      `INSERT INTO visitor_messages (visitor_email, message, is_agent, agent_id, created_at, conversation_id) 
+       VALUES (?, ?, ?, ?, NOW(), ?)`,
+      [visitor_email, message, is_agent ? 1 : 0, agent_id || null, conversation_id]
+    );
+    
+    // Get the created_at timestamp
+    const [newMessage] = await pool.query(
+      'SELECT created_at FROM visitor_messages WHERE id = ?',
+      [result.insertId]
+    );
+    
+    // Update visitor's updated_at
+    await pool.query(
+      'UPDATE visitors SET updated_at = NOW() WHERE email = ? AND conversation_id = ?',
+      [visitor_email, conversation_id]
+    );
+    
+    const timestamp = new Date(newMessage[0].created_at).toISOString();
+    
+    res.json({
+      success: true,
+      data: {
+        id: result.insertId,
+        visitor_email,
+        message,
+        is_agent: is_agent || false,
+        agent_id: agent_id || null,
+        conversation_id,
+        created_at: timestamp,
+        timestamp: timestamp
+      }
+    });
+  } catch (error) {
+    console.error('Error saving message:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Get agent by ID
+app.get('/api/agents/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        
+        const [agents] = await pool.query(
+            'SELECT id, name, email, role FROM agents WHERE id = ?',
+            [id]
+        );
+        
+        if (agents.length === 0) {
+            return res.status(404).json({ success: false, error: 'Agent not found' });
+        }
+        
+        res.json({ success: true, data: agents[0] });
+    } catch (error) {
+        console.error('Error fetching agent:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+
+
+
+
+
+
+
+
 // Health check endpoint from routes
 app.get('/api/health-check', async (req, res) => {
   try {
@@ -3076,7 +3933,7 @@ app.listen(PORT, () => {
 Mode: ${isDevelopment ? 'Development' : 'Production'}
 URL: http://localhost:${PORT}
 API Base: http://localhost:${PORT}/api
-Frontend: http://192.168.68.4:5177
+Frontend: http://192.168.68.76:5177
 Database: Connected
 ===========================================
 📝 Development Features:
