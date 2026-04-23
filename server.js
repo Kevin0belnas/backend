@@ -41,6 +41,8 @@ app.use(session({
   }
 }));
 
+
+
 /*
 |--------------------------------------------------------------------------
 | CORS CONFIGURATION (DEVELOPMENT MODE)
@@ -53,7 +55,7 @@ const corsOptions = {
     if (!origin && isDevelopment) return callback(null, true);
     
     const allowedOrigins = [
-      'http://192.168.68.78:5177', // Your LAN IP for development
+      'http://192.168.68.51:5177', // Your LAN IP for development
       'http://localhost:5177',     // Localhost for development
       'http://localhost:5173',     // Additional local port
       'http://127.0.0.1:5177',     // Localhost IP
@@ -74,12 +76,15 @@ const corsOptions = {
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
 };
 
+// CORS first
 app.use(cors(corsOptions));
 
 // Handle preflight requests
 app.options('*', cors(corsOptions));
 
-app.use(express.json());
+// THEN increase payload limits (only ONCE)
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 /*
 |--------------------------------------------------------------------------
@@ -1703,10 +1708,30 @@ app.patch('/api/social-media-links/:id/status', async (req, res) => {
 app.use('/uploads/social-media', express.static('uploads/social-media'));
 
 
-// ========== EVENT ROUTES ==========
-// ========== DISPLAY EVENTS ENDPOINT ==========
+// ========== EVENT ROUTES WITH BASE64 STORAGE ==========
 
-// GET events for display (public frontend)
+// Helper function to validate and optimize Base64 images
+const validateAndOptimizeBase64 = (base64String) => {
+  if (!base64String) return null;
+  
+  // Check if it's a valid Base64 image
+  if (!base64String.startsWith('data:image/')) {
+    return null;
+  }
+  
+  // Check size (approximate - Base64 is about 33% larger than binary)
+  const sizeInBytes = Buffer.from(base64String.split(',')[1] || '', 'base64').length;
+  const sizeInMB = sizeInBytes / (1024 * 1024);
+  
+  // Reject images larger than 2MB each
+  if (sizeInMB > 5) {
+    return null;
+  }
+  
+  return base64String;
+};
+
+// GET events for display (public frontend) - UPDATED for Base64
 app.get('/api/events-display', async (req, res) => {
   try {
     const { 
@@ -1779,61 +1804,23 @@ app.get('/api/events-display', async (req, res) => {
       params.push(parseInt(limit), offset);
     }
     
-    console.log('📝 Executing display query:', query.substring(0, 200) + '...');
-    console.log('🔢 With params:', params);
+    console.log('📝 Executing display query');
     
     const [rows] = await pool.query(query, params);
     
-    // Helper function to format image URLs
-    const formatImageUrls = (imagePath) => {
-      if (!imagePath) return [];
-      
-      // If it's already a full array with URLs
-      if (Array.isArray(imagePath)) {
-        return imagePath.map(img => {
-          if (img.startsWith('http')) return img;
-          if (img.startsWith('/uploads/')) return img;
-          return `/uploads/events/${img}`;
-        });
-      }
-      
-      // If it's a string, try to parse JSON or handle as string
-      if (typeof imagePath === 'string') {
-        try {
-          const parsed = JSON.parse(imagePath);
-          if (Array.isArray(parsed)) {
-            return parsed.map(img => {
-              if (img.startsWith('http')) return img;
-              if (img.startsWith('/uploads/')) return img;
-              return `/uploads/events/${img}`;
-            });
-          }
-          return [`/uploads/events/${parsed}`];
-        } catch (error) {
-          // Not JSON, treat as string
-          if (imagePath.startsWith('http')) return [imagePath];
-          if (imagePath.startsWith('/uploads/')) return [imagePath];
-          if (imagePath.includes(',')) {
-            return imagePath.split(',')
-              .map(img => img.trim())
-              .filter(img => img)
-              .map(img => {
-                if (img.startsWith('http')) return img;
-                if (img.startsWith('/uploads/')) return img;
-                return `/uploads/events/${img}`;
-              });
-          }
-          return [`/uploads/events/${imagePath}`];
-        }
-      }
-      
-      return [];
-    };
-    
     // Process events for display
     const events = rows.map(event => {
-      // Parse gallery images with proper URLs
-      const galleryImages = formatImageUrls(event.gallery_images);
+      // Parse gallery images from JSON (stored as Base64 strings)
+      let galleryImages = [];
+      try {
+        if (event.gallery_images) {
+          const parsed = JSON.parse(event.gallery_images);
+          galleryImages = Array.isArray(parsed) ? parsed : [];
+        }
+      } catch (e) {
+        console.error('Error parsing gallery images:', e);
+        galleryImages = [];
+      }
       
       // Calculate event status dynamically if not set
       let eventStatus = event.status;
@@ -1897,7 +1884,7 @@ app.get('/api/events-display', async (req, res) => {
         event_type: event.event_type,
         status: eventStatus,
         featured: event.featured === 1,
-        gallery_images: galleryImages,
+        gallery_images: galleryImages, // Now contains Base64 strings
         attendees_count: attendeesCount,
         max_attendees: maxAttendees,
         available_seats: availableSeats,
@@ -1907,7 +1894,7 @@ app.get('/api/events-display', async (req, res) => {
       };
     });
     
-    // Count total events for pagination (need a separate query for count)
+    // Count total events for pagination
     let countQuery = `
       SELECT COUNT(*) as total 
       FROM events e
@@ -1937,7 +1924,6 @@ app.get('/api/events-display', async (req, res) => {
     const totalEvents = countResult[0]?.total || events.length;
     
     console.log(`✅ Found ${events.length} display events out of ${totalEvents} total`);
-    console.log(`🖼️ Sample event images:`, events[0]?.gallery_images);
     
     res.json({ 
       success: true, 
@@ -1959,44 +1945,7 @@ app.get('/api/events-display', async (req, res) => {
   }
 });
 
-// Configure multer for event gallery images upload
-const eventStorage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const uploadDir = 'uploads/events';
-    
-    if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir, { recursive: true });
-    }
-    
-    cb(null, uploadDir);
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    const ext = path.extname(file.originalname).toLowerCase();
-    // Store just the filename, not the full path
-    cb(null, `event-${uniqueSuffix}${ext}`);
-  }
-});
-
-const eventFileFilter = (req, file, cb) => {
-  const allowedTypes = /jpeg|jpg|png|gif|webp/;
-  const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
-  const mimetype = allowedTypes.test(file.mimetype);
-
-  if (extname && mimetype) {
-    return cb(null, true);
-  } else {
-    cb(new Error('Only image files are allowed (jpeg, jpg, png, gif, webp)'));
-  }
-};
-
-const uploadEventImages = multer({ 
-  storage: eventStorage, 
-  fileFilter: eventFileFilter,
-  limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit per file
-});
-
-// GET all events with search and filters (ADMIN)
+// GET all events with search and filters (ADMIN) - UPDATED for Base64
 app.get('/api/events', requireAdmin, async (req, res) => {
   try {
     const { search, status, eventType } = req.query;
@@ -2029,49 +1978,38 @@ app.get('/api/events', requireAdmin, async (req, res) => {
     
     const [rows] = await pool.query(query, params);
     
-    // Helper function to format image URLs for admin
-    const formatImageUrls = (imagePath) => {
-      if (!imagePath) return [];
-      
-      if (typeof imagePath === 'string') {
-        try {
-          const parsed = JSON.parse(imagePath);
-          if (Array.isArray(parsed)) {
-            return parsed.map(img => `/uploads/events/${path.basename(img)}`);
-          }
-          return [`/uploads/events/${path.basename(parsed)}`];
-        } catch (error) {
-          if (imagePath.includes(',')) {
-            return imagePath.split(',')
-              .map(img => img.trim())
-              .filter(img => img)
-              .map(img => `/uploads/events/${path.basename(img)}`);
-          }
-          return [`/uploads/events/${path.basename(imagePath)}`];
+    // Parse gallery images from JSON
+    const events = rows.map(event => {
+      let galleryImages = [];
+      try {
+        if (event.gallery_images) {
+          const parsed = JSON.parse(event.gallery_images);
+          galleryImages = Array.isArray(parsed) ? parsed : [];
         }
+      } catch (e) {
+        console.error('Error parsing gallery images:', e);
+        galleryImages = [];
       }
       
-      return [];
-    };
-    
-    const events = rows.map(event => ({
-      id: event.id,
-      title: event.title,
-      date: event.date,
-      start_date: event.start_date,
-      end_date: event.end_date,
-      author_name: event.author_name,
-      bookstore_location: event.bookstore_location,
-      address: event.address,
-      description: event.description,
-      featured_books: event.featured_books,
-      event_type: event.event_type,
-      status: event.status,
-      featured: event.featured === 1,
-      gallery_images: formatImageUrls(event.gallery_images),
-      created_at: event.created_at,
-      updated_at: event.updated_at
-    }));
+      return {
+        id: event.id,
+        title: event.title,
+        date: event.date,
+        start_date: event.start_date,
+        end_date: event.end_date,
+        author_name: event.author_name,
+        bookstore_location: event.bookstore_location,
+        address: event.address,
+        description: event.description,
+        featured_books: event.featured_books,
+        event_type: event.event_type,
+        status: event.status,
+        featured: event.featured === 1,
+        gallery_images: galleryImages, // Base64 strings
+        created_at: event.created_at,
+        updated_at: event.updated_at
+      };
+    });
     
     res.json({ 
       success: true, 
@@ -2088,11 +2026,10 @@ app.get('/api/events', requireAdmin, async (req, res) => {
   }
 });
 
-// POST create event with multiple images
-app.post('/api/events', requireAdmin, uploadEventImages.array('galleryImages', 10), async (req, res) => {
+// POST create event with Base64 images - UPDATED
+app.post('/api/events', requireAdmin, async (req, res) => {
   try {
-    console.log('📝 Creating new event...');
-    console.log('📁 Uploaded files:', req.files);
+    console.log('📝 Creating new event with Base64 images...');
     
     const {
       title,
@@ -2105,71 +2042,89 @@ app.post('/api/events', requireAdmin, uploadEventImages.array('galleryImages', 1
       featuredBooks,
       eventType,
       status,
-      featured
+      featured,
+      galleryImages = []
     } = req.body;
 
     // Validate required fields
     if (!title || !authorName || !bookstoreLocation || !address || !description || !startDate || !endDate) {
-      console.log('❌ Validation failed - missing required fields');
-      
-      // Delete uploaded files if validation fails
-      if (req.files && req.files.length > 0) {
-        req.files.forEach(file => {
-          fs.unlink(file.path, (err) => {
-            if (err) console.error('❌ Error deleting uploaded file:', err);
-          });
-        });
-      }
-      
       return res.status(400).json({ 
         success: false, 
         error: 'All fields marked with * are required' 
       });
     }
 
-    // Handle gallery images - store just filenames in database
-    let galleryImages = [];
-    if (req.files && req.files.length > 0) {
-      galleryImages = req.files.map(file => file.filename); // Just store filename
-      console.log('🖼️ Storing images:', galleryImages);
+    // Validate and optimize images
+    const validImages = [];
+    const invalidImages = [];
+    
+    for (const img of galleryImages) {
+      const validated = validateAndOptimizeBase64(img);
+      if (validated) {
+        validImages.push(validated);
+      } else {
+        invalidImages.push(img.substring(0, 50) + '...');
+      }
+    }
+    
+    if (invalidImages.length > 0) {
+      console.warn(`⚠️ ${invalidImages.length} invalid images were rejected`);
+    }
+    
+    // Check total size (max 10MB for all images combined)
+    let totalSize = 0;
+    for (const img of validImages) {
+      const sizeInBytes = Buffer.from(img.split(',')[1] || '', 'base64').length;
+      totalSize += sizeInBytes;
+    }
+    
+    const MAX_TOTAL_SIZE = 10 * 1024 * 1024; // 10MB
+    if (totalSize > MAX_TOTAL_SIZE) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Total image size exceeds 10MB limit. Please use smaller images or fewer images.' 
+      });
     }
 
     // Parse dates for MySQL
+    const parseDateForMySQL = (dateString) => {
+      if (!dateString) return null;
+      const date = new Date(dateString);
+      if (isNaN(date.getTime())) return null;
+      return date.toISOString().split('T')[0];
+    };
+    
     const mysqlStartDate = parseDateForMySQL(startDate);
     const mysqlEndDate = parseDateForMySQL(endDate);
-
-    console.log('📅 Date parsing:', {
-      inputStartDate: startDate,
-      mysqlStartDate,
-      inputEndDate: endDate,
-      mysqlEndDate
-    });
 
     // Generate display date from start and end dates
     const generateDisplayDate = (start, end) => {
       if (!start) return '';
       
-      const startDate = new Date(start);
-      const endDate = end ? new Date(end) : null;
+      const startDateObj = new Date(start);
+      const endDateObj = end ? new Date(end) : null;
       
-      if (isNaN(startDate.getTime())) return '';
+      if (isNaN(startDateObj.getTime())) return '';
       
-      if (!end || isNaN(endDate.getTime()) || start === end) {
-        return startDate.toLocaleDateString('en-US', { 
+      if (!end || isNaN(endDateObj.getTime()) || start === end) {
+        return startDateObj.toLocaleDateString('en-US', { 
           month: 'long', 
           day: 'numeric', 
           year: 'numeric' 
         });
       }
       
-      if (startDate.getMonth() === endDate.getMonth() && startDate.getFullYear() === endDate.getFullYear()) {
-        return `${startDate.toLocaleDateString('en-US', { month: 'long' })} ${startDate.getDate()}-${endDate.getDate()}, ${startDate.getFullYear()}`;
+      if (startDateObj.getMonth() === endDateObj.getMonth() && startDateObj.getFullYear() === endDateObj.getFullYear()) {
+        return `${startDateObj.toLocaleDateString('en-US', { month: 'long' })} ${startDateObj.getDate()}-${endDateObj.getDate()}, ${startDateObj.getFullYear()}`;
       }
       
-      return `${startDate.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })} - ${endDate.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}`;
+      return `${startDateObj.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })} - ${endDateObj.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}`;
     };
 
     const displayDate = generateDisplayDate(mysqlStartDate, mysqlEndDate);
+
+    // Store gallery images as JSON array of Base64 strings
+    const galleryImagesJson = JSON.stringify(validImages);
 
     const [result] = await pool.query(
       `INSERT INTO events 
@@ -2178,7 +2133,7 @@ app.post('/api/events', requireAdmin, uploadEventImages.array('galleryImages', 1
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         title,
-        displayDate, // Generated display date
+        displayDate,
         mysqlStartDate,
         mysqlEndDate,
         authorName,
@@ -2189,7 +2144,7 @@ app.post('/api/events', requireAdmin, uploadEventImages.array('galleryImages', 1
         eventType || 'Book Signing',
         status || 'Upcoming',
         featured === 'true' || featured === true ? 1 : 0,
-        JSON.stringify(galleryImages) // Store as JSON array of filenames
+        galleryImagesJson
       ]
     );
 
@@ -2207,10 +2162,10 @@ app.post('/api/events', requireAdmin, uploadEventImages.array('galleryImages', 1
       event_type: eventType,
       status,
       featured: featured === 'true' || featured === true,
-      gallery_images: galleryImages.map(img => `/uploads/events/${img}`) // Return full URLs for response
+      gallery_images: validImages // Return Base64 strings
     };
 
-    console.log('✅ Event created successfully:', newEvent.id);
+    console.log('✅ Event created successfully with Base64 images:', newEvent.id);
 
     res.status(201).json({ 
       success: true, 
@@ -2219,16 +2174,6 @@ app.post('/api/events', requireAdmin, uploadEventImages.array('galleryImages', 1
     });
   } catch (error) {
     console.error('❌ Error creating event:', error);
-    
-    // Delete uploaded files if error occurred
-    if (req.files && req.files.length > 0) {
-      req.files.forEach(file => {
-        fs.unlink(file.path, (err) => {
-          if (err) console.error('❌ Error deleting uploaded file:', err);
-        });
-      });
-    }
-    
     res.status(500).json({ 
       success: false, 
       error: 'Failed to create event',
@@ -2237,8 +2182,8 @@ app.post('/api/events', requireAdmin, uploadEventImages.array('galleryImages', 1
   }
 });
 
-// PUT update event
-app.put('/api/events/:id', requireAdmin, uploadEventImages.array('galleryImages', 10), async (req, res) => {
+// PUT update event with Base64 images - UPDATED
+app.put('/api/events/:id', requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     console.log('📝 Updating event ID:', id);
@@ -2254,57 +2199,56 @@ app.put('/api/events/:id', requireAdmin, uploadEventImages.array('galleryImages'
       featuredBooks,
       eventType,
       status,
-      featured
+      featured,
+      galleryImages = [], // New Base64 images
+      existingImages = [] // Existing Base64 images to keep
     } = req.body;
 
     // Get existing event
     const [existingRows] = await pool.query('SELECT gallery_images FROM events WHERE id = ?', [id]);
     
     if (existingRows.length === 0) {
-      console.log('❌ Event not found:', id);
-      
-      // Delete uploaded files if event doesn't exist
-      if (req.files && req.files.length > 0) {
-        req.files.forEach(file => {
-          fs.unlink(file.path, (err) => {
-            if (err) console.error('❌ Error deleting uploaded file:', err);
-          });
-        });
-      }
-      
       return res.status(404).json({ 
         success: false, 
         error: 'Event not found' 
       });
     }
 
-    // Parse existing gallery images (they should be stored as filenames)
-    let existingImages = [];
-    try {
-      const parsed = existingRows[0].gallery_images ? JSON.parse(existingRows[0].gallery_images) : [];
-      existingImages = Array.isArray(parsed) ? parsed : [parsed];
-    } catch (e) {
-      console.error('❌ Error parsing existing gallery images:', e);
-      // If it's a string with comma separation
-      if (typeof existingRows[0].gallery_images === 'string') {
-        existingImages = existingRows[0].gallery_images.split(',')
-          .map(img => img.trim())
-          .filter(img => img)
-          .map(img => path.basename(img)); // Extract just filename
+    // Validate new images
+    const validNewImages = [];
+    for (const img of galleryImages) {
+      const validated = validateAndOptimizeBase64(img);
+      if (validated) {
+        validNewImages.push(validated);
       }
     }
-
-    // Handle new gallery images
-    let newImages = [];
-    if (req.files && req.files.length > 0) {
-      newImages = req.files.map(file => file.filename); // Just store filenames
-      console.log('🖼️ New images to add:', newImages);
+    
+    // Combine existing images (keep the ones user wants) with new valid images
+    const allImages = [...existingImages, ...validNewImages];
+    
+    // Check total size (max 10MB for all images combined)
+    let totalSize = 0;
+    for (const img of allImages) {
+      const sizeInBytes = Buffer.from(img.split(',')[1] || '', 'base64').length;
+      totalSize += sizeInBytes;
+    }
+    
+    const MAX_TOTAL_SIZE = 10 * 1024 * 1024; // 10MB
+    if (totalSize > MAX_TOTAL_SIZE) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Total image size exceeds 10MB limit. Please use smaller images or fewer images.' 
+      });
     }
 
-    // Combine existing and new images (both should be just filenames)
-    const allImages = [...existingImages, ...newImages];
-    
     // Parse dates for MySQL
+    const parseDateForMySQL = (dateString) => {
+      if (!dateString) return null;
+      const date = new Date(dateString);
+      if (isNaN(date.getTime())) return null;
+      return date.toISOString().split('T')[0];
+    };
+    
     const mysqlStartDate = parseDateForMySQL(startDate);
     const mysqlEndDate = parseDateForMySQL(endDate);
 
@@ -2312,24 +2256,24 @@ app.put('/api/events/:id', requireAdmin, uploadEventImages.array('galleryImages'
     const generateDisplayDate = (start, end) => {
       if (!start) return '';
       
-      const startDate = new Date(start);
-      const endDate = end ? new Date(end) : null;
+      const startDateObj = new Date(start);
+      const endDateObj = end ? new Date(end) : null;
       
-      if (isNaN(startDate.getTime())) return '';
+      if (isNaN(startDateObj.getTime())) return '';
       
-      if (!end || isNaN(endDate.getTime()) || start === end) {
-        return startDate.toLocaleDateString('en-US', { 
+      if (!end || isNaN(endDateObj.getTime()) || start === end) {
+        return startDateObj.toLocaleDateString('en-US', { 
           month: 'long', 
           day: 'numeric', 
           year: 'numeric' 
         });
       }
       
-      if (startDate.getMonth() === endDate.getMonth() && startDate.getFullYear() === endDate.getFullYear()) {
-        return `${startDate.toLocaleDateString('en-US', { month: 'long' })} ${startDate.getDate()}-${endDate.getDate()}, ${startDate.getFullYear()}`;
+      if (startDateObj.getMonth() === endDateObj.getMonth() && startDateObj.getFullYear() === endDateObj.getFullYear()) {
+        return `${startDateObj.toLocaleDateString('en-US', { month: 'long' })} ${startDateObj.getDate()}-${endDateObj.getDate()}, ${startDateObj.getFullYear()}`;
       }
       
-      return `${startDate.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })} - ${endDate.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}`;
+      return `${startDateObj.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })} - ${endDateObj.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}`;
     };
 
     const displayDate = generateDisplayDate(mysqlStartDate, mysqlEndDate);
@@ -2337,7 +2281,7 @@ app.put('/api/events/:id', requireAdmin, uploadEventImages.array('galleryImages'
     // Prepare update data
     const updateData = {
       title: title ? title.trim() : undefined,
-      date: displayDate, // Generated display date
+      date: displayDate,
       start_date: mysqlStartDate,
       end_date: mysqlEndDate,
       author_name: authorName ? authorName.trim() : undefined,
@@ -2348,7 +2292,7 @@ app.put('/api/events/:id', requireAdmin, uploadEventImages.array('galleryImages'
       event_type: eventType || undefined,
       status: status || undefined,
       featured: featured !== undefined ? (featured === 'true' || featured === true ? 1 : 0) : undefined,
-      gallery_images: JSON.stringify(allImages) // Store as JSON array of filenames
+      gallery_images: JSON.stringify(allImages) // Store as JSON array of Base64 strings
     };
 
     // Remove undefined values
@@ -2358,19 +2302,15 @@ app.put('/api/events/:id', requireAdmin, uploadEventImages.array('galleryImages'
       }
     });
 
-    console.log('💾 Update data:', updateData);
-
-    // Build dynamic UPDATE query
-    const fields = Object.keys(updateData);
-    if (fields.length === 0) {
+    if (Object.keys(updateData).length === 0) {
       return res.status(400).json({ 
         success: false, 
         error: 'No data provided for update' 
       });
     }
 
-    const setClause = fields.map(field => `${field} = ?`).join(', ');
-    const values = fields.map(field => updateData[field]);
+    const setClause = Object.keys(updateData).map(field => `${field} = ?`).join(', ');
+    const values = Object.values(updateData);
     values.push(id);
 
     const query = `UPDATE events SET ${setClause} WHERE id = ?`;
@@ -2388,15 +2328,17 @@ app.put('/api/events/:id', requireAdmin, uploadEventImages.array('galleryImages'
     const [updatedRows] = await pool.query('SELECT * FROM events WHERE id = ?', [id]);
     const updatedEvent = updatedRows[0];
 
-    // Format gallery images for response
+    // Parse gallery images
     let responseGalleryImages = [];
     try {
-      const parsed = updatedEvent.gallery_images ? JSON.parse(updatedEvent.gallery_images) : [];
-      responseGalleryImages = Array.isArray(parsed) 
-        ? parsed.map(img => `/uploads/events/${img}`)
-        : [`/uploads/events/${parsed}`];
+      if (updatedEvent.gallery_images) {
+        responseGalleryImages = JSON.parse(updatedEvent.gallery_images);
+        if (!Array.isArray(responseGalleryImages)) {
+          responseGalleryImages = [];
+        }
+      }
     } catch (e) {
-      console.error('❌ Error parsing gallery images for response:', e);
+      console.error('Error parsing gallery images:', e);
     }
 
     const responseEvent = {
@@ -2418,7 +2360,7 @@ app.put('/api/events/:id', requireAdmin, uploadEventImages.array('galleryImages'
       updated_at: updatedEvent.updated_at
     };
 
-    console.log('✅ Event updated successfully:', id);
+    console.log('✅ Event updated successfully with Base64 images:', id);
 
     res.json({ 
       success: true, 
@@ -2427,16 +2369,6 @@ app.put('/api/events/:id', requireAdmin, uploadEventImages.array('galleryImages'
     });
   } catch (error) {
     console.error('❌ Error updating event:', error);
-    
-    // Delete uploaded files if error occurred
-    if (req.files && req.files.length > 0) {
-      req.files.forEach(file => {
-        fs.unlink(file.path, (err) => {
-          if (err) console.error('❌ Error deleting uploaded file:', err);
-        });
-      });
-    }
-    
     res.status(500).json({ 
       success: false, 
       error: 'Failed to update event',
@@ -2445,6 +2377,79 @@ app.put('/api/events/:id', requireAdmin, uploadEventImages.array('galleryImages'
   }
 });
 
+// DELETE route for removing specific image by index - UPDATED
+app.delete('/api/events/:id/image/:index', requireAdmin, async (req, res) => {
+  try {
+    const { id, index } = req.params;
+    
+    // Get current gallery images
+    const [rows] = await pool.query('SELECT gallery_images FROM events WHERE id = ?', [id]);
+    
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Event not found' });
+    }
+    
+    let galleryImages = [];
+    try {
+      if (rows[0].gallery_images) {
+        galleryImages = JSON.parse(rows[0].gallery_images);
+        if (!Array.isArray(galleryImages)) {
+          galleryImages = [];
+        }
+      }
+    } catch (e) {
+      console.error('Error parsing gallery images:', e);
+      galleryImages = [];
+    }
+    
+    // Remove image at specified index
+    const imageIndex = parseInt(index);
+    if (imageIndex >= 0 && imageIndex < galleryImages.length) {
+      galleryImages.splice(imageIndex, 1);
+    } else {
+      return res.status(400).json({ success: false, error: 'Invalid image index' });
+    }
+    
+    // Update database
+    await pool.query(
+      'UPDATE events SET gallery_images = ? WHERE id = ?',
+      [JSON.stringify(galleryImages), id]
+    );
+    
+    res.json({ 
+      success: true, 
+      message: 'Image removed successfully',
+      images_remaining: galleryImages.length
+    });
+  } catch (error) {
+    console.error('Error removing image:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// DELETE event
+app.delete('/api/events/:id', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const [result] = await pool.query('DELETE FROM events WHERE id = ?', [id]);
+    
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Event not found' 
+      });
+    }
+    
+    res.json({ 
+      success: true, 
+      message: 'Event deleted successfully' 
+    });
+  } catch (error) {
+    console.error('Error deleting event:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
 
 // POST register for an event (public)
 app.post('/api/events/:id/register', async (req, res) => {
@@ -2507,7 +2512,7 @@ app.post('/api/events/:id/register', async (req, res) => {
       });
     }
     
-    // Optional: Check event capacity
+    // Check event capacity
     const [registrationCountRows] = await pool.query(
       `SELECT COUNT(*) as count FROM event_registrations 
        WHERE event_id = ? AND status IN ('pending', 'confirmed')`,
@@ -2515,9 +2520,8 @@ app.post('/api/events/:id/register', async (req, res) => {
     );
     
     const registrationCount = registrationCountRows[0].count;
+    const maxCapacity = 100; // Default capacity
     
-    // Assuming max capacity of 100 if not specified
-    const maxCapacity = 100;
     if (registrationCount >= maxCapacity) {
       return res.status(400).json({ 
         success: false, 
