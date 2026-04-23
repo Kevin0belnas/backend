@@ -417,24 +417,84 @@ app.get('/api/admin/dashboard', requireAdmin, async (req, res) => {
   }
 });
 
-/*
-|--------------------------------------------------------------------------
-| BOOKSTORE ROUTES
-|--------------------------------------------------------------------------
-*/
 
-// GET all bookstores
+// ========== BOOKSTORE ROUTES WITH BASE64 ==========
+
+// Helper function to validate and optimize Base64 images for bookstores
+const validateBookstoreImage = (base64String) => {
+  if (!base64String) return null;
+  
+  // Check if it's a valid Base64 image
+  if (!base64String.startsWith('data:image/')) {
+    return null;
+  }
+  
+  // Check size (max 2MB for bookstore images)
+  const sizeInBytes = Buffer.from(base64String.split(',')[1] || '', 'base64').length;
+  const sizeInMB = sizeInBytes / (1024 * 1024);
+  
+  if (sizeInMB > 2) {
+    return null;
+  }
+  
+  return base64String;
+};
+
+// GET all bookstores (with Base64 images)
 app.get('/api/bookstores', async (req, res) => {
   try {
     const [rows] = await pool.query('SELECT * FROM bookstores ORDER BY created_at DESC');
-    res.json({ success: true, data: rows });
+    
+    // Parse Base64 images using the same pattern as authors
+    const parsedRows = rows.map(row => {
+      let imageUrl = null;
+      
+      if (row.image_url) {
+        // Check if it's a JSON string array
+        if (typeof row.image_url === 'string' && row.image_url.startsWith('[')) {
+          try {
+            const parsed = JSON.parse(row.image_url);
+            if (Array.isArray(parsed) && parsed.length > 0 && parsed[0].startsWith('data:image')) {
+              imageUrl = parsed[0];
+            } else if (Array.isArray(parsed) && parsed.length > 0) {
+              imageUrl = parsed[0];
+            }
+          } catch (e) {
+            imageUrl = row.image_url;
+          }
+        } 
+        // Check if it's already a Base64 string
+        else if (typeof row.image_url === 'string' && row.image_url.startsWith('data:image')) {
+          imageUrl = row.image_url;
+        }
+        // Check if it's a JSON object
+        else if (typeof row.image_url === 'string' && row.image_url.startsWith('{')) {
+          try {
+            const parsed = JSON.parse(row.image_url);
+            imageUrl = Array.isArray(parsed) ? parsed[0] : parsed;
+          } catch (e) {
+            imageUrl = row.image_url;
+          }
+        }
+        else {
+          imageUrl = row.image_url;
+        }
+      }
+      
+      return {
+        ...row,
+        image_url: imageUrl
+      };
+    });
+    
+    res.json({ success: true, data: parsedRows });
   } catch (error) {
     console.error('Error fetching bookstores:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// GET single bookstore by ID
+// GET single bookstore by ID (with Base64)
 app.get('/api/bookstores/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -447,10 +507,45 @@ app.get('/api/bookstores/:id', async (req, res) => {
     
     const bookstore = bookstoreRows[0];
     
-    // Get authors for this bookstore
-    const [authorRows] = await pool.query('SELECT * FROM authors WHERE bookstore_id = ?', [id]);
+    // Parse image - handle array format
+    let imageUrl = null;
+    if (bookstore.image_url) {
+      if (typeof bookstore.image_url === 'string' && bookstore.image_url.startsWith('[')) {
+        try {
+          const parsed = JSON.parse(bookstore.image_url);
+          if (Array.isArray(parsed) && parsed.length > 0 && parsed[0].startsWith('data:image')) {
+            imageUrl = parsed[0];
+          } else if (Array.isArray(parsed) && parsed.length > 0) {
+            imageUrl = parsed[0];
+          }
+        } catch (e) {
+          imageUrl = bookstore.image_url;
+        }
+      } 
+      else if (typeof bookstore.image_url === 'string' && bookstore.image_url.startsWith('data:image')) {
+        imageUrl = bookstore.image_url;
+      }
+      else if (typeof bookstore.image_url === 'string' && bookstore.image_url.startsWith('{')) {
+        try {
+          const parsed = JSON.parse(bookstore.image_url);
+          imageUrl = Array.isArray(parsed) ? parsed[0] : parsed;
+        } catch (e) {
+          imageUrl = bookstore.image_url;
+        }
+      }
+      else {
+        imageUrl = bookstore.image_url;
+      }
+    }
     
-    // Get books for this bookstore
+    // Get authors for this bookstore and parse their avatars
+    const [authorRows] = await pool.query('SELECT * FROM authors WHERE bookstore_id = ?', [id]);
+    const parsedAuthors = authorRows.map(author => ({
+      ...author,
+      avatar: parseAvatar(author.avatar)
+    }));
+    
+    // Get books for this bookstore and parse their images
     const [bookRows] = await pool.query(`
       SELECT b.*, a.name as author_name 
       FROM books b 
@@ -458,12 +553,18 @@ app.get('/api/bookstores/:id', async (req, res) => {
       WHERE b.bookstore_id = ?
     `, [id]);
     
+    const parsedBooks = bookRows.map(book => ({
+      ...book,
+      image_url: parseBookImage(book.image_url)
+    }));
+    
     res.json({
       success: true,
       data: {
         ...bookstore,
-        authors: authorRows,
-        books: bookRows
+        image_url: imageUrl,
+        authors: parsedAuthors,
+        books: parsedBooks
       }
     });
   } catch (error) {
@@ -472,75 +573,8 @@ app.get('/api/bookstores/:id', async (req, res) => {
   }
 });
 
-// Configure multer for file upload
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const uploadDir = 'uploads/bookstores';
-    
-    if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir, { recursive: true });
-    }
-    
-    cb(null, uploadDir);
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    const ext = path.extname(file.originalname).toLowerCase();
-    cb(null, `bookstore-${uniqueSuffix}${ext}`);
-  }
-});
-
-const fileFilter = (req, file, cb) => {
-  const allowedTypes = /jpeg|jpg|png|gif|webp|svg/;
-  const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
-  const mimetype = allowedTypes.test(file.mimetype);
-
-  if (extname && mimetype) {
-    return cb(null, true);
-  } else {
-    cb(new Error('Only image files are allowed (jpeg, jpg, png, gif, webp, svg)'));
-  }
-};
-
-const upload = multer({ 
-  storage, 
-  fileFilter,
-  limits: { fileSize: 10 * 1024 * 1024 }
-});
-
-// Enhanced POST route with better error handling
-app.post('/api/bookstores', requireAdmin, (req, res, next) => {
-  upload.single('image')(req, res, function(err) {
-    if (err) {
-      console.error('Multer error:', err.message);
-      
-      if (err instanceof multer.MulterError) {
-        if (err.code === 'LIMIT_FILE_SIZE') {
-          return res.status(400).json({ 
-            success: false, 
-            error: 'File size too large. Maximum size is 10MB.' 
-          });
-        }
-      }
-      
-      if (err.message.includes('Only image files')) {
-        return res.status(400).json({ 
-          success: false, 
-          error: err.message 
-        });
-      }
-      
-      return res.status(500).json({ 
-        success: false, 
-        error: 'File upload failed' 
-      });
-    }
-    
-    createBookstore(req, res);
-  });
-});
-
-async function createBookstore(req, res) {
+// POST create bookstore (with Base64 image)
+app.post('/api/bookstores', requireAdmin, async (req, res) => {
   try {
     const {
       name,
@@ -554,21 +588,41 @@ async function createBookstore(req, res) {
       logo = '📚',
       category = 'Independent',
       rating = 0,
-      reviews = 0
+      reviews = 0,
+      image // Base64 string
     } = req.body;
 
-    // Clean the established field - convert empty string to null
-    const cleanEstablished = established === '' ? null : parseInt(established);
-    
-    // Clean the rating and reviews fields
-    const cleanRating = rating === '' ? 0 : parseInt(rating);
-    const cleanReviews = reviews === '' ? 0 : parseInt(reviews);
-    
-    // Clean the phone field
-    const cleanPhone = phone.trim();
+    if (isDevelopment) {
+      console.log('Bookstore POST request:', { name, location, category });
+      console.log('Has image:', !!image);
+    }
 
-    // Get uploaded file path (if any)
-    const imageUrl = req.file ? `/uploads/bookstores/${req.file.filename}` : null;
+    // Validate required fields
+    if (!name || !location) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Name and location are required' 
+      });
+    }
+
+    // Clean and validate fields
+    const cleanEstablished = established === '' ? null : parseInt(established);
+    const cleanRating = rating === '' ? 0 : parseFloat(rating);
+    const cleanReviews = reviews === '' ? 0 : parseInt(reviews);
+    const cleanPhone = phone ? phone.trim() : '';
+    
+    // Validate and optimize image
+    let imageToStore = null;
+    if (image) {
+      const validatedImage = validateBookstoreImage(image);
+      if (!validatedImage) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'Invalid or oversized image. Maximum size is 2MB.' 
+        });
+      }
+      imageToStore = JSON.stringify([validatedImage]);
+    }
 
     const [result] = await pool.query(
       `INSERT INTO bookstores 
@@ -587,7 +641,7 @@ async function createBookstore(req, res) {
         category, 
         cleanRating,
         cleanReviews,
-        imageUrl
+        imageToStore
       ]
     );
 
@@ -605,7 +659,7 @@ async function createBookstore(req, res) {
       category,
       rating: cleanRating,
       reviews: cleanReviews,
-      image_url: imageUrl
+      image_url: imageToStore ? JSON.parse(imageToStore)[0] : null
     };
 
     res.status(201).json({ 
@@ -615,119 +669,107 @@ async function createBookstore(req, res) {
     });
   } catch (error) {
     console.error('Error creating bookstore:', error);
-    
-    if (req.file) {
-      fs.unlink(req.file.path, (err) => {
-        if (err) console.error('Error deleting uploaded file:', err);
-      });
-    }
-    
     res.status(500).json({ success: false, error: error.message });
   }
-}
-
-// PUT update bookstore (protected - admin only)
-app.put('/api/bookstores/:id', requireAdmin, (req, res, next) => {
-  upload.single('image')(req, res, function(err) {
-    if (err) {
-      console.error('Multer error:', err.message);
-      
-      if (err instanceof multer.MulterError) {
-        if (err.code === 'LIMIT_FILE_SIZE') {
-          return res.status(400).json({ 
-            success: false, 
-            error: 'File size too large. Maximum size is 10MB.' 
-          });
-        }
-      }
-      
-      if (err.message.includes('Only image files')) {
-        return res.status(400).json({ 
-          success: false, 
-          error: err.message 
-        });
-      }
-      
-      return res.status(500).json({ 
-        success: false, 
-        error: 'File upload failed' 
-      });
-    }
-    
-    updateBookstore(req, res);
-  });
 });
 
-async function updateBookstore(req, res) {
+// PUT update bookstore (with Base64 image)
+app.put('/api/bookstores/:id', requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    const updateData = {};
-    
-    // Add all text fields from req.body
-    Object.keys(req.body).forEach(key => {
-      if (req.body[key] !== undefined && req.body[key] !== '') {
-        // Clean specific fields
-        if (key === 'established') {
-          updateData[key] = req.body[key] === '' ? null : parseInt(req.body[key]);
-        } else if (key === 'rating' || key === 'reviews') {
-          updateData[key] = req.body[key] === '' ? 0 : parseInt(req.body[key]);
-        } else if (key === 'phone') {
-          updateData[key] = req.body[key].trim();
-        } else {
-          updateData[key] = req.body[key];
-        }
-      }
-    });
-    
-    // Handle uploaded file
-    if (req.file) {
-      updateData.image_url = `/uploads/bookstores/${req.file.filename}`;
-      
-      // Optional: Delete old image file
-      try {
-        const [existingRows] = await pool.query('SELECT image_url FROM bookstores WHERE id = ?', [id]);
-        if (existingRows.length > 0 && existingRows[0].image_url) {
-          const oldImagePath = `uploads/bookstores/${existingRows[0].image_url.split('/').pop()}`;
-          fs.unlink(oldImagePath, (err) => {
-            if (err && err.code !== 'ENOENT') {
-              console.error('Error deleting old image:', err);
-            }
-          });
-        }
-      } catch (err) {
-        console.error('Error deleting old image:', err);
-      }
+    const {
+      name,
+      location,
+      address,
+      established,
+      description,
+      email,
+      phone,
+      website,
+      logo,
+      category,
+      rating,
+      reviews,
+      image // Base64 string
+    } = req.body;
+
+    if (isDevelopment) {
+      console.log('Bookstore PUT request:', { id, name, category });
+      console.log('Has image:', !!image);
     }
+
+    // Check if bookstore exists
+    const [existingRows] = await pool.query('SELECT id, image_url FROM bookstores WHERE id = ?', [id]);
     
-    // If no fields to update
-    if (Object.keys(updateData).length === 0) {
-      return res.status(400).json({ success: false, error: 'No fields to update' });
+    if (existingRows.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Bookstore not found' 
+      });
     }
+
+    // Clean fields
+    const cleanEstablished = established === '' ? null : parseInt(established);
+    const cleanRating = rating === '' ? 0 : parseFloat(rating);
+    const cleanReviews = reviews === '' ? 0 : parseInt(reviews);
+    const cleanPhone = phone ? phone.trim() : '';
+
+    // Handle image update
+    let imageToStore = existingRows[0].image_url;
     
-    const fields = Object.keys(updateData);
-    const values = Object.values(updateData);
-    
-    const setClause = fields.map(field => `${field} = ?`).join(', ');
-    const query = `UPDATE bookstores SET ${setClause} WHERE id = ?`;
-    
-    await pool.query(query, [...values, id]);
+    if (image) {
+      const validatedImage = validateBookstoreImage(image);
+      if (!validatedImage) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'Invalid or oversized image. Maximum size is 2MB.' 
+        });
+      }
+      imageToStore = JSON.stringify([validatedImage]);
+    }
+
+    await pool.query(
+      `UPDATE bookstores SET 
+        name = ?,
+        location = ?,
+        address = ?,
+        established = ?,
+        description = ?,
+        email = ?,
+        phone = ?,
+        website = ?,
+        logo = ?,
+        category = ?,
+        rating = ?,
+        reviews = ?,
+        image_url = ?
+      WHERE id = ?`,
+      [
+        name,
+        location,
+        address || null,
+        cleanEstablished,
+        description || null,
+        email || null,
+        cleanPhone,
+        website || null,
+        logo || '📚',
+        category || 'Independent',
+        cleanRating,
+        cleanReviews,
+        imageToStore,
+        id
+      ]
+    );
     
     res.json({ success: true, message: 'Bookstore updated successfully' });
   } catch (error) {
     console.error('Error updating bookstore:', error);
-    
-    // Delete uploaded file if error occurred
-    if (req.file) {
-      fs.unlink(req.file.path, (err) => {
-        if (err) console.error('Error deleting uploaded file:', err);
-      });
-    }
-    
     res.status(500).json({ success: false, error: error.message });
   }
-}
+});
 
-// DELETE bookstore (protected - admin only)
+// DELETE bookstore
 app.delete('/api/bookstores/:id', requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
@@ -741,13 +783,75 @@ app.delete('/api/bookstores/:id', requireAdmin, async (req, res) => {
   }
 });
 
-/*
-|--------------------------------------------------------------------------
-| AUTHOR ROUTES
-|--------------------------------------------------------------------------
-*/
 
-// GET all authors (for admin panel)
+// ========== AUTHOR ROUTES WITH BASE64 ==========
+
+// Helper function to validate and optimize Base64 images for authors
+const validateAuthorImage = (base64String) => {
+  if (!base64String) return null;
+  
+  // Check if it's a valid Base64 image
+  if (!base64String.startsWith('data:image/')) {
+    return null;
+  }
+  
+  // Check size (max 500KB for author avatars)
+  const sizeInBytes = Buffer.from(base64String.split(',')[1] || '', 'base64').length;
+  const sizeInMB = sizeInBytes / (1024 * 1024);
+  
+  if (sizeInMB > 0.5) {
+    return null;
+  }
+  
+  return base64String;
+};
+
+// Helper function to parse avatar from database
+const parseAvatar = (avatarData) => {
+  if (!avatarData) return '👤';
+  
+  // If it's a JSON string array (our storage format)
+  if (typeof avatarData === 'string' && avatarData.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(avatarData);
+      if (Array.isArray(parsed) && parsed.length > 0 && parsed[0].startsWith('data:image')) {
+        return parsed[0];  // Return just the Base64 string, not the array
+      }
+      return parsed;
+    } catch (e) {
+      // Not valid JSON, return as is
+      return avatarData;
+    }
+  }
+  
+  // If it's already a Base64 string
+  if (typeof avatarData === 'string' && avatarData.startsWith('data:image')) {
+    return avatarData;
+  }
+  
+  // If it's a JSON object string (old format)
+  if (typeof avatarData === 'string' && avatarData.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(avatarData);
+      if (Array.isArray(parsed) && parsed.length > 0 && parsed[0].startsWith('data:image')) {
+        return parsed[0];
+      }
+      return parsed;
+    } catch (e) {
+      return avatarData;
+    }
+  }
+  
+  // If it's an array (unlikely but possible)
+  if (Array.isArray(avatarData) && avatarData.length > 0 && avatarData[0].startsWith('data:image')) {
+    return avatarData[0];
+  }
+  
+  // Default - return as is (should be emoji)
+  return avatarData;
+};
+
+// GET all authors (for admin panel) - with Base64 images
 app.get('/api/authors', requireAdmin, async (req, res) => {
   try {
     const [rows] = await pool.query(`
@@ -756,14 +860,21 @@ app.get('/api/authors', requireAdmin, async (req, res) => {
       LEFT JOIN bookstores b ON a.bookstore_id = b.id 
       ORDER BY a.created_at DESC
     `);
-    res.json({ success: true, data: rows });
+    
+    // Parse Base64 avatars using the helper function
+    const parsedRows = rows.map(row => ({
+      ...row,
+      avatar: parseAvatar(row.avatar)
+    }));
+    
+    res.json({ success: true, data: parsedRows });
   } catch (error) {
     console.error('Error fetching all authors:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// GET author by ID
+// GET author by ID - with Base64
 app.get('/api/authors/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -776,6 +887,9 @@ app.get('/api/authors/:id', async (req, res) => {
     
     const author = authorRows[0];
     
+    // Parse avatar using helper
+    const avatar = parseAvatar(author.avatar);
+    
     // Get books for this author
     const [bookRows] = await pool.query(`
       SELECT b.*, a.name as author_name 
@@ -784,11 +898,32 @@ app.get('/api/authors/:id', async (req, res) => {
       WHERE b.author_id = ?
     `, [id]);
     
+    // Process book images if they exist
+    const processedBooks = bookRows.map(book => {
+      let bookImage = book.image_url;
+      try {
+        if (book.image_url && book.image_url.startsWith('data:image')) {
+          bookImage = book.image_url;
+        } else if (book.image_url && book.image_url.startsWith('{')) {
+          const parsed = JSON.parse(book.image_url);
+          bookImage = Array.isArray(parsed) ? parsed[0] : parsed;
+        }
+      } catch (e) {
+        bookImage = book.image_url;
+      }
+      
+      return {
+        ...book,
+        image_url: bookImage
+      };
+    });
+    
     res.json({
       success: true,
       data: {
         ...author,
-        books: bookRows
+        avatar: avatar,
+        books: processedBooks
       }
     });
   } catch (error) {
@@ -797,7 +932,7 @@ app.get('/api/authors/:id', async (req, res) => {
   }
 });
 
-// GET author's books (for the modal in frontend)
+// GET author's books (for the modal in frontend) - with Base64
 app.get('/api/authors/:id/books', async (req, res) => {
   try {
     const { id } = req.params;
@@ -819,11 +954,17 @@ app.get('/api/authors/:id/books', async (req, res) => {
       ORDER BY b.created_at DESC
     `, [id]);
     
+    // Process book images using parseBookImage
+    const processedBooks = bookRows.map(book => ({
+      ...book,
+      image_url: parseBookImage(book.image_url)
+    }));
+    
     res.json({
       success: true,
       data: {
         author: author,
-        books: bookRows
+        books: processedBooks
       }
     });
   } catch (error) {
@@ -832,7 +973,7 @@ app.get('/api/authors/:id/books', async (req, res) => {
   }
 });
 
-// PUT update author
+// PUT update author - with Base64 avatar
 app.put('/api/authors/:id', requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
@@ -846,6 +987,23 @@ app.put('/api/authors/:id', requireAdmin, async (req, res) => {
       });
     }
     
+    // Validate and optimize avatar if it's an image
+    let avatarToStore = avatar;
+    if (avatar && avatar.startsWith('data:image')) {
+      const validatedAvatar = validateAuthorImage(avatar);
+      if (!validatedAvatar) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'Invalid or oversized avatar image. Maximum size is 500KB.' 
+        });
+      }
+      // Store as JSON string array
+      avatarToStore = JSON.stringify([validatedAvatar]);
+    } else if (avatar && !avatar.startsWith('data:image')) {
+      // For emojis, store as plain string
+      avatarToStore = avatar;
+    }
+    
     const [result] = await pool.query(
       `UPDATE authors SET 
        bookstore_id = ?, 
@@ -855,7 +1013,7 @@ app.put('/api/authors/:id', requireAdmin, async (req, res) => {
        avatar = ?, 
        books_count = ? 
        WHERE id = ?`,
-      [bookstore_id, name, genre, bio, avatar, books_count, id]
+      [bookstore_id, name, genre, bio, avatarToStore, books_count, id]
     );
     
     if (result.affectedRows === 0) {
@@ -867,7 +1025,16 @@ app.put('/api/authors/:id', requireAdmin, async (req, res) => {
     
     res.json({ 
       success: true, 
-      message: 'Author updated successfully' 
+      message: 'Author updated successfully',
+      data: {
+        id: parseInt(id),
+        bookstore_id,
+        name,
+        genre,
+        bio,
+        avatar: avatar, // Return the original for response
+        books_count
+      }
     });
   } catch (error) {
     console.error('Error updating author:', error);
@@ -899,19 +1066,26 @@ app.delete('/api/authors/:id', requireAdmin, async (req, res) => {
   }
 });
 
-// GET authors by bookstore
+// GET authors by bookstore - with Base64
 app.get('/api/authors/bookstore/:bookstoreId', async (req, res) => {
   try {
     const { bookstoreId } = req.params;
     const [rows] = await pool.query('SELECT * FROM authors WHERE bookstore_id = ?', [bookstoreId]);
-    res.json({ success: true, data: rows });
+    
+    // Parse avatars using helper
+    const parsedRows = rows.map(row => ({
+      ...row,
+      avatar: parseAvatar(row.avatar)
+    }));
+    
+    res.json({ success: true, data: parsedRows });
   } catch (error) {
     console.error('Error fetching authors:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// POST create author (protected - admin only)
+// POST create author - with Base64 avatar
 app.post('/api/authors', requireAdmin, async (req, res) => {
   try {
     const {
@@ -940,10 +1114,24 @@ app.post('/api/authors', requireAdmin, async (req, res) => {
       });
     }
     
+    // Validate and optimize avatar if it's an image
+    let avatarToStore = avatar;
+    if (avatar && avatar.startsWith('data:image')) {
+      const validatedAvatar = validateAuthorImage(avatar);
+      if (!validatedAvatar) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'Invalid or oversized avatar image. Maximum size is 500KB.' 
+        });
+      }
+      // Store as JSON string array
+      avatarToStore = JSON.stringify([validatedAvatar]);
+    }
+    
     const [result] = await pool.query(
       `INSERT INTO authors (bookstore_id, name, genre, bio, avatar, books_count) 
       VALUES (?, ?, ?, ?, ?, ?)`,
-      [bookstore_id, name, genre, bio, avatar, books_count]
+      [bookstore_id, name, genre, bio, avatarToStore, books_count]
     );
     
     const newAuthor = {
@@ -952,7 +1140,7 @@ app.post('/api/authors', requireAdmin, async (req, res) => {
       name,
       genre,
       bio,
-      avatar,
+      avatar: avatar, // Return the original for preview
       books_count
     };
     
@@ -967,11 +1155,28 @@ app.post('/api/authors', requireAdmin, async (req, res) => {
   }
 });
 
-/*
-|--------------------------------------------------------------------------
-| BOOK ROUTES
-|--------------------------------------------------------------------------
-*/
+
+// ========== BOOK ROUTES WITH BASE64 ==========
+
+// Helper function to validate and optimize Base64 images for books
+const validateBookImage = (base64String) => {
+  if (!base64String) return null;
+  
+  // Check if it's a valid Base64 image
+  if (!base64String.startsWith('data:image/')) {
+    return null;
+  }
+  
+  // Check size (max 2MB for book covers)
+  const sizeInBytes = Buffer.from(base64String.split(',')[1] || '', 'base64').length;
+  const sizeInMB = sizeInBytes / (1024 * 1024);
+  
+  if (sizeInMB > 2) {
+    return null;
+  }
+  
+  return base64String;
+};
 
 // GET all books (for admin panel)
 app.get('/api/books', requireAdmin, async (req, res) => {
@@ -983,14 +1188,183 @@ app.get('/api/books', requireAdmin, async (req, res) => {
       JOIN bookstores bs ON b.bookstore_id = bs.id 
       ORDER BY b.created_at DESC
     `);
-    res.json({ success: true, data: rows });
+    
+    // Parse Base64 images
+    const parsedRows = rows.map(row => ({
+      ...row,
+      image_url: parseBookImage(row.image_url)
+    }));
+    
+    res.json({ success: true, data: parsedRows });
   } catch (error) {
     console.error('Error fetching all books:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// PUT update book
+// Helper function to parse book image from database
+const parseBookImage = (imageData) => {
+  if (!imageData) return null;
+  
+  // If it's already a Base64 string
+  if (typeof imageData === 'string' && imageData.startsWith('data:image')) {
+    return imageData;
+  }
+  
+  // If it's a JSON string array (our storage format) - CHECK FOR ARRAY FIRST
+  if (typeof imageData === 'string' && imageData.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(imageData);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        const firstImage = parsed[0];
+        if (firstImage && firstImage.startsWith('data:image')) {
+          return firstImage;
+        }
+        return firstImage;
+      }
+    } catch (e) {
+      console.error('Error parsing array image data:', e);
+      return imageData;
+    }
+  }
+  
+  // If it's a JSON object string (old format)
+  if (typeof imageData === 'string' && imageData.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(imageData);
+      if (Array.isArray(parsed) && parsed.length > 0 && parsed[0].startsWith('data:image')) {
+        return parsed[0];
+      }
+      return parsed;
+    } catch (e) {
+      return imageData;
+    }
+  }
+  
+  // If it's an array
+  if (Array.isArray(imageData) && imageData.length > 0 && imageData[0].startsWith('data:image')) {
+    return imageData[0];
+  }
+  
+  return imageData;
+};
+
+// GET book by ID
+app.get('/api/books/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const [rows] = await pool.query(`
+      SELECT b.*, a.name as author_name, bs.name as bookstore_name 
+      FROM books b 
+      JOIN authors a ON b.author_id = a.id 
+      JOIN bookstores bs ON b.bookstore_id = bs.id 
+      WHERE b.id = ?
+    `, [id]);
+    
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Book not found' });
+    }
+    
+    const book = rows[0];
+    book.image_url = parseBookImage(book.image_url);
+    
+    res.json({ success: true, data: book });
+  } catch (error) {
+    console.error('Error fetching book:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// POST create book - with Base64 image
+app.post('/api/books', requireAdmin, async (req, res) => {
+  try {
+    const {
+      bookstore_id,
+      author_id,
+      title,
+      price = 0,
+      genre = '',
+      published_date = null,
+      isbn = '',
+      description = '',
+      image_url = null
+    } = req.body;
+    
+    // Validate required fields
+    if (!bookstore_id || !author_id || !title) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Bookstore ID, author ID, and title are required' 
+      });
+    }
+    
+    // Check if bookstore exists
+    const [bookstoreRows] = await pool.query('SELECT id FROM bookstores WHERE id = ?', [bookstore_id]);
+    if (bookstoreRows.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Bookstore not found' 
+      });
+    }
+    
+    // Check if author exists and belongs to bookstore
+    const [authorRows] = await pool.query(
+      'SELECT id FROM authors WHERE id = ? AND bookstore_id = ?', 
+      [author_id, bookstore_id]
+    );
+    if (authorRows.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Author not found or does not belong to the selected bookstore' 
+      });
+    }
+    
+    // Validate and optimize image if provided
+    let imageToStore = null;
+    if (image_url && image_url.startsWith('data:image')) {
+      const validatedImage = validateBookImage(image_url);
+      if (!validatedImage) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'Invalid or oversized book cover image. Maximum size is 2MB.' 
+        });
+      }
+      // Store as JSON string array
+      imageToStore = JSON.stringify([validatedImage]);
+    }
+    
+    const [result] = await pool.query(
+      `INSERT INTO books (bookstore_id, author_id, title, price, genre, published_date, isbn, description, image_url) 
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [bookstore_id, author_id, title, price, genre, published_date, isbn, description, imageToStore]
+    );
+    
+    const newBook = {
+      id: result.insertId,
+      bookstore_id,
+      author_id,
+      title,
+      price,
+      genre,
+      published_date,
+      isbn,
+      description,
+      image_url: image_url // Return the original for preview
+    };
+    
+    res.status(201).json({ 
+      success: true, 
+      data: newBook,
+      message: 'Book created successfully'
+    });
+  } catch (error) {
+    console.error('Error creating book:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// PUT update book - with Base64 image
 app.put('/api/books/:id', requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
@@ -1014,6 +1388,22 @@ app.put('/api/books/:id', requireAdmin, async (req, res) => {
       });
     }
     
+    // Validate and optimize image if it's a new Base64 image
+    let imageToStore = image_url;
+    if (image_url && image_url.startsWith('data:image')) {
+      const validatedImage = validateBookImage(image_url);
+      if (!validatedImage) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'Invalid or oversized book cover image. Maximum size is 2MB.' 
+        });
+      }
+      imageToStore = JSON.stringify([validatedImage]);
+    } else if (image_url && !image_url.startsWith('data:image')) {
+      // Keep existing image URL/path as is
+      imageToStore = image_url;
+    }
+    
     const [result] = await pool.query(
       `UPDATE books SET 
        bookstore_id = ?, 
@@ -1026,7 +1416,7 @@ app.put('/api/books/:id', requireAdmin, async (req, res) => {
        description = ?,
        image_url = ? 
        WHERE id = ?`,
-      [bookstore_id, author_id, title, price, genre, published_date, isbn, description, image_url, id]
+      [bookstore_id, author_id, title, price, genre, published_date, isbn, description, imageToStore, id]
     );
     
     if (result.affectedRows === 0) {
@@ -1080,7 +1470,13 @@ app.get('/api/books/bookstore/:bookstoreId', async (req, res) => {
       JOIN authors a ON b.author_id = a.id 
       WHERE b.bookstore_id = ?
     `, [bookstoreId]);
-    res.json({ success: true, data: rows });
+    
+    const parsedRows = rows.map(row => ({
+      ...row,
+      image_url: parseBookImage(row.image_url)
+    }));
+    
+    res.json({ success: true, data: parsedRows });
   } catch (error) {
     console.error('Error fetching books:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -1097,214 +1493,43 @@ app.get('/api/books/author/:authorId', async (req, res) => {
       JOIN authors a ON b.author_id = a.id 
       WHERE b.author_id = ?
     `, [authorId]);
-    res.json({ success: true, data: rows });
+    
+    const parsedRows = rows.map(row => ({
+      ...row,
+      image_url: parseBookImage(row.image_url)
+    }));
+    
+    res.json({ success: true, data: parsedRows });
   } catch (error) {
     console.error('Error fetching books by author:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// Configure multer for book image upload
-const bookStorage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const uploadDir = 'uploads/books';
-    
-    if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir, { recursive: true });
-    }
-    
-    cb(null, uploadDir);
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    const ext = path.extname(file.originalname).toLowerCase();
-    cb(null, `book-${uniqueSuffix}${ext}`);
-  }
-});
 
-const bookFileFilter = (req, file, cb) => {
-  const allowedTypes = /jpeg|jpg|png|gif|webp/;
-  const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
-  const mimetype = allowedTypes.test(file.mimetype);
+// ========== SOCIAL MEDIA LINKS ROUTES WITH BASE64 & MULTIPLE LINKS SUPPORT ==========
 
-  if (extname && mimetype) {
-    return cb(null, true);
-  } else {
-    cb(new Error('Only image files are allowed (jpeg, jpg, png, gif, webp)'));
+// Helper function to validate and optimize Base64 images for social media
+const validateSocialMediaImage = (base64String) => {
+  if (!base64String) return null;
+  
+  // Check if it's a valid Base64 image
+  if (!base64String.startsWith('data:image/')) {
+    return null;
   }
+  
+  // Check size (max 1MB for author images)
+  const sizeInBytes = Buffer.from(base64String.split(',')[1] || '', 'base64').length;
+  const sizeInMB = sizeInBytes / (1024 * 1024);
+  
+  if (sizeInMB > 1) {
+    return null;
+  }
+  
+  return base64String;
 };
 
-const uploadBookImage = multer({ 
-  storage: bookStorage, 
-  fileFilter: bookFileFilter,
-  limits: { fileSize: 5 * 1024 * 1024 }
-});
-
-// POST route for uploading book images
-app.post('/api/books/upload-image', requireAdmin, (req, res, next) => {
-  uploadBookImage.single('image')(req, res, function(err) {
-    if (err) {
-      console.error('Book image upload error:', err.message);
-      
-      if (err instanceof multer.MulterError) {
-        if (err.code === 'LIMIT_FILE_SIZE') {
-          return res.status(400).json({ 
-            success: false, 
-            error: 'File size too large. Maximum size is 5MB.' 
-          });
-        }
-      }
-      
-      if (err.message.includes('Only image files')) {
-        return res.status(400).json({ 
-          success: false, 
-          error: err.message 
-        });
-      }
-      
-      return res.status(500).json({ 
-        success: false, 
-        error: 'File upload failed' 
-      });
-    }
-    
-    if (!req.file) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'No file uploaded' 
-      });
-    }
-    
-    res.json({
-      success: true,
-      data: {
-        imageUrl: `/uploads/books/${req.file.filename}`
-      },
-      message: 'Book image uploaded successfully'
-    });
-  });
-});
-
-// POST create book (protected - admin only)
-app.post('/api/books', requireAdmin, async (req, res) => {
-  try {
-    const {
-      bookstore_id,
-      author_id,
-      title,
-      price = 0,
-      genre = '',
-      published_date = null,
-      isbn = '',
-      description = ''
-    } = req.body;
-    
-    // Validate required fields
-    if (!bookstore_id || !author_id || !title) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Bookstore ID, author ID, and title are required' 
-      });
-    }
-    
-    // Check if bookstore exists
-    const [bookstoreRows] = await pool.query('SELECT id FROM bookstores WHERE id = ?', [bookstore_id]);
-    if (bookstoreRows.length === 0) {
-      return res.status(404).json({ 
-        success: false, 
-        error: 'Bookstore not found' 
-      });
-    }
-    
-    // Check if author exists
-    const [authorRows] = await pool.query('SELECT id FROM authors WHERE id = ?', [author_id]);
-    if (authorRows.length === 0) {
-      return res.status(404).json({ 
-        success: false, 
-        error: 'Author not found' 
-      });
-    }
-    
-    // Check if author belongs to the bookstore
-    const [authorBookstoreRows] = await pool.query(
-      'SELECT id FROM authors WHERE id = ? AND bookstore_id = ?', 
-      [author_id, bookstore_id]
-    );
-    if (authorBookstoreRows.length === 0) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Author does not belong to the selected bookstore' 
-      });
-    }
-    
-    const [result] = await pool.query(
-      `INSERT INTO books (bookstore_id, author_id, title, price, genre, published_date, isbn, description) 
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [bookstore_id, author_id, title, price, genre, published_date, isbn, description]
-    );
-    
-    const newBook = {
-      id: result.insertId,
-      bookstore_id,
-      author_id,
-      title,
-      price,
-      genre,
-      published_date,
-      isbn,
-      description
-    };
-    
-    res.status(201).json({ 
-      success: true, 
-      data: newBook,
-      message: 'Book created successfully'
-    });
-  } catch (error) {
-    console.error('Error creating book:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// ========== SOCIAL MEDIA LINKS ROUTES ==========
-
-// Configure multer for social media links image upload
-const socialMediaStorage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const uploadDir = 'uploads/social-media';
-    
-    if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir, { recursive: true });
-    }
-    
-    cb(null, uploadDir);
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    const ext = path.extname(file.originalname).toLowerCase();
-    cb(null, `social-media-${uniqueSuffix}${ext}`);
-  }
-});
-
-const socialMediaFileFilter = (req, file, cb) => {
-  const allowedTypes = /jpeg|jpg|png|gif|webp/;
-  const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
-  const mimetype = allowedTypes.test(file.mimetype);
-
-  if (extname && mimetype) {
-    return cb(null, true);
-  } else {
-    cb(new Error('Only image files are allowed (jpeg, jpg, png, gif, webp)'));
-  }
-};
-
-const uploadSocialMedia = multer({ 
-  storage: socialMediaStorage, 
-  fileFilter: socialMediaFileFilter,
-  limits: { fileSize: 5 * 1024 * 1024 } // 5MB limit
-});
-
-// GET all social media links (updated to serve full image URLs)
+// GET all social media links (with Base64 images) - GROUPED BY AUTHOR
 app.get('/api/social-media-links', async (req, res) => {
   try {
     const [rows] = await pool.query(`
@@ -1317,30 +1542,79 @@ app.get('/api/social-media-links', async (req, res) => {
         username,
         url,
         description,
+        custom_label as customLabel,
+        display_order as displayOrder,
         is_active as isActive,
         created_at as createdAt,
         updated_at as updatedAt
       FROM social_media_links 
-      ORDER BY created_at DESC
+      ORDER BY author_name, display_order ASC, platform, created_at DESC
     `);
     
-    // Transform the data to include full URL for images
-    const transformedRows = rows.map(row => ({
-      ...row,
-      authorImage: row.authorImage ? `/uploads/social-media/${row.authorImage}` : null
-    }));
+    // Group links by author
+    const authorsMap = new Map();
     
-    res.json(transformedRows);
+    rows.forEach(row => {
+      let authorImage = null;
+      try {
+        if (row.authorImage) {
+          const parsed = JSON.parse(row.authorImage);
+          authorImage = Array.isArray(parsed) ? parsed[0] : parsed;
+        }
+      } catch (e) {
+        authorImage = row.authorImage;
+      }
+      
+      const authorKey = row.authorName;
+      
+      if (!authorsMap.has(authorKey)) {
+        authorsMap.set(authorKey, {
+          id: row.id,
+          authorName: row.authorName,
+          authorEmail: row.authorEmail,
+          authorImage: authorImage,
+          isActive: row.isActive,
+          links: [],
+          createdAt: row.createdAt,
+          updatedAt: row.updatedAt
+        });
+      }
+      
+      const author = authorsMap.get(authorKey);
+      author.links.push({
+        id: row.id,
+        platform: row.platform,
+        username: row.username,
+        url: row.url,
+        description: row.description,
+        customLabel: row.customLabel,
+        displayOrder: row.displayOrder,
+        isActive: row.isActive,
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt
+      });
+      
+      // Sort links by display order
+      author.links.sort((a, b) => (a.displayOrder || 0) - (b.displayOrder || 0));
+    });
+    
+    const result = Array.from(authorsMap.values());
+    
+    res.json({ 
+      success: true, 
+      data: result,
+      total: result.length 
+    });
   } catch (error) {
     console.error('Error fetching social media links:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// GET single social media link by ID (updated)
-app.get('/api/social-media-links/:id', async (req, res) => {
+// GET single author's social media links by name
+app.get('/api/social-media-links/author/:authorName', async (req, res) => {
   try {
-    const { id } = req.params;
+    const { authorName } = req.params;
     const [rows] = await pool.query(`
       SELECT 
         id,
@@ -1351,29 +1625,58 @@ app.get('/api/social-media-links/:id', async (req, res) => {
         username,
         url,
         description,
+        custom_label as customLabel,
+        display_order as displayOrder,
         is_active as isActive,
         created_at as createdAt,
         updated_at as updatedAt
       FROM social_media_links 
-      WHERE id = ?
-    `, [id]);
+      WHERE author_name = ?
+      ORDER BY display_order ASC, platform, created_at DESC
+    `, [decodeURIComponent(authorName)]);
     
     if (rows.length === 0) {
-      return res.status(404).json({ error: 'Social media link not found' });
+      return res.status(404).json({ error: 'Author not found' });
     }
     
-    const link = rows[0];
-    link.authorImage = link.authorImage ? `/uploads/social-media/${link.authorImage}` : null;
+    let authorImage = null;
+    try {
+      if (rows[0].authorImage) {
+        const parsed = JSON.parse(rows[0].authorImage);
+        authorImage = Array.isArray(parsed) ? parsed[0] : parsed;
+      }
+    } catch (e) {
+      authorImage = rows[0].authorImage;
+    }
     
-    res.json(link);
+    const author = {
+      authorName: rows[0].authorName,
+      authorEmail: rows[0].authorEmail,
+      authorImage: authorImage,
+      isActive: rows[0].isActive,
+      links: rows.map(row => ({
+        id: row.id,
+        platform: row.platform,
+        username: row.username,
+        url: row.url,
+        description: row.description,
+        customLabel: row.customLabel,
+        displayOrder: row.displayOrder,
+        isActive: row.isActive,
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt
+      }))
+    };
+    
+    res.json({ success: true, data: author });
   } catch (error) {
-    console.error('Error fetching social media link:', error);
+    console.error('Error fetching author links:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// POST create new social media link (UPDATED with Multer)
-app.post('/api/social-media-links', uploadSocialMedia.single('authorImage'), async (req, res) => {
+// POST create new social media link (supports multiple per author)
+app.post('/api/social-media-links', async (req, res) => {
   try {
     const {
       authorName,
@@ -1382,21 +1685,18 @@ app.post('/api/social-media-links', uploadSocialMedia.single('authorImage'), asy
       username,
       url,
       description,
-      isActive
+      customLabel,
+      displayOrder,
+      isActive,
+      authorImage // Base64 string
     } = req.body;
 
-    // Log the request for debugging
     if (isDevelopment) {
-      console.log('Social media POST request body:', req.body);
-      console.log('Social media POST file:', req.file);
+      console.log('Social media POST request:', { authorName, platform, username, url });
     }
 
     // Validate required fields
     if (!authorName || !url || !platform) {
-      // If there's a file uploaded, remove it
-      if (req.file) {
-        fs.unlinkSync(req.file.path);
-      }
       return res.status(400).json({ error: 'Author name, URL, and platform are required' });
     }
 
@@ -1404,24 +1704,45 @@ app.post('/api/social-media-links', uploadSocialMedia.single('authorImage'), asy
     try {
       new URL(url);
     } catch (err) {
-      if (req.file) {
-        fs.unlinkSync(req.file.path);
-      }
       return res.status(400).json({ error: 'Invalid URL format' });
     }
 
+    // Validate and optimize image (only for first link of author)
+    let validatedImage = null;
+    if (authorImage) {
+      validatedImage = validateSocialMediaImage(authorImage);
+      if (!validatedImage) {
+        return res.status(400).json({ error: 'Invalid or oversized image. Maximum size is 1MB.' });
+      }
+    } else {
+      // Check if author already has an image
+      const [existingAuthor] = await pool.query(
+        'SELECT author_image FROM social_media_links WHERE author_name = ? AND author_image IS NOT NULL LIMIT 1',
+        [authorName]
+      );
+      if (existingAuthor.length > 0) {
+        validatedImage = existingAuthor[0].author_image;
+      }
+    }
+
+    // Store image as JSON
+    const imageToStore = validatedImage ? JSON.stringify([validatedImage]) : null;
+
     const [result] = await pool.query(
       `INSERT INTO social_media_links 
-        (author_name, author_email, author_image, platform, username, url, description, is_active) 
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        (author_name, author_email, author_image, platform, username, url, description, 
+         custom_label, display_order, is_active) 
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         authorName,
         authorEmail || null,
-        req.file ? req.file.filename : null,
+        imageToStore,
         platform,
         username || null,
         url,
         description || null,
+        customLabel || null,
+        displayOrder || 0,
         isActive !== undefined ? (isActive === 'true' || isActive === true) : true
       ]
     );
@@ -1437,6 +1758,8 @@ app.post('/api/social-media-links', uploadSocialMedia.single('authorImage'), asy
         username,
         url,
         description,
+        custom_label as customLabel,
+        display_order as displayOrder,
         is_active as isActive,
         created_at as createdAt,
         updated_at as updatedAt
@@ -1445,21 +1768,26 @@ app.post('/api/social-media-links', uploadSocialMedia.single('authorImage'), asy
     `, [result.insertId]);
 
     const link = newLink[0];
-    link.authorImage = link.authorImage ? `/uploads/social-media/${link.authorImage}` : null;
+    let parsedImage = null;
+    try {
+      if (link.authorImage) {
+        const parsed = JSON.parse(link.authorImage);
+        parsedImage = Array.isArray(parsed) ? parsed[0] : parsed;
+      }
+    } catch (e) {
+      parsedImage = link.authorImage;
+    }
+    link.authorImage = parsedImage;
 
-    res.status(201).json(link);
+    res.status(201).json({ success: true, data: link });
   } catch (error) {
     console.error('Error creating social media link:', error);
-    // If there's a file uploaded, remove it on error
-    if (req.file) {
-      fs.unlinkSync(req.file.path);
-    }
     res.status(500).json({ error: error.message });
   }
 });
 
-// PUT update social media link (UPDATED with Multer)
-app.put('/api/social-media-links/:id', uploadSocialMedia.single('authorImage'), async (req, res) => {
+// PUT update social media link
+app.put('/api/social-media-links/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const {
@@ -1469,32 +1797,28 @@ app.put('/api/social-media-links/:id', uploadSocialMedia.single('authorImage'), 
       username,
       url,
       description,
-      isActive
+      customLabel,
+      displayOrder,
+      isActive,
+      authorImage
     } = req.body;
 
     if (isDevelopment) {
-      console.log('Social media PUT request body:', req.body);
-      console.log('Social media PUT file:', req.file);
+      console.log('Social media PUT request:', { id, platform, username });
     }
 
     // Check if link exists
     const [existing] = await pool.query(
-      'SELECT id, author_image FROM social_media_links WHERE id = ?', 
+      'SELECT id, author_image, author_name FROM social_media_links WHERE id = ?', 
       [id]
     );
     
     if (existing.length === 0) {
-      if (req.file) {
-        fs.unlinkSync(req.file.path);
-      }
       return res.status(404).json({ error: 'Social media link not found' });
     }
 
     // Validate required fields
     if (!authorName || !url || !platform) {
-      if (req.file) {
-        fs.unlinkSync(req.file.path);
-      }
       return res.status(400).json({ error: 'Author name, URL, and platform are required' });
     }
 
@@ -1502,25 +1826,18 @@ app.put('/api/social-media-links/:id', uploadSocialMedia.single('authorImage'), 
     try {
       new URL(url);
     } catch (err) {
-      if (req.file) {
-        fs.unlinkSync(req.file.path);
-      }
       return res.status(400).json({ error: 'Invalid URL format' });
     }
 
     // Handle image update
-    let authorImage = existing[0].author_image;
+    let authorImageToStore = existing[0].author_image;
     
-    // If new image uploaded, remove old one and use new one
-    if (req.file) {
-      // Remove old image if exists
-      if (existing[0].author_image) {
-        const oldImagePath = path.join('uploads/social-media', existing[0].author_image);
-        if (fs.existsSync(oldImagePath)) {
-          fs.unlinkSync(oldImagePath);
-        }
+    if (authorImage) {
+      const validatedImage = validateSocialMediaImage(authorImage);
+      if (!validatedImage) {
+        return res.status(400).json({ error: 'Invalid or oversized image. Maximum size is 1MB.' });
       }
-      authorImage = req.file.filename;
+      authorImageToStore = JSON.stringify([validatedImage]);
     }
 
     await pool.query(
@@ -1533,17 +1850,21 @@ app.put('/api/social-media-links/:id', uploadSocialMedia.single('authorImage'), 
          username = ?,
          url = ?,
          description = ?,
+         custom_label = ?,
+         display_order = ?,
          is_active = ?,
          updated_at = CURRENT_TIMESTAMP
        WHERE id = ?`,
       [
         authorName,
         authorEmail || null,
-        authorImage,
+        authorImageToStore,
         platform,
         username || null,
         url,
         description || null,
+        customLabel || null,
+        displayOrder || 0,
         isActive !== undefined ? (isActive === 'true' || isActive === true) : true,
         id
       ]
@@ -1560,6 +1881,8 @@ app.put('/api/social-media-links/:id', uploadSocialMedia.single('authorImage'), 
         username,
         url,
         description,
+        custom_label as customLabel,
+        display_order as displayOrder,
         is_active as isActive,
         created_at as createdAt,
         updated_at as updatedAt
@@ -1568,39 +1891,36 @@ app.put('/api/social-media-links/:id', uploadSocialMedia.single('authorImage'), 
     `, [id]);
 
     const link = updatedLink[0];
-    link.authorImage = link.authorImage ? `/uploads/social-media/${link.authorImage}` : null;
+    let parsedImage = null;
+    try {
+      if (link.authorImage) {
+        const parsed = JSON.parse(link.authorImage);
+        parsedImage = Array.isArray(parsed) ? parsed[0] : parsed;
+      }
+    } catch (e) {
+      parsedImage = link.authorImage;
+    }
+    link.authorImage = parsedImage;
 
-    res.json(link);
+    res.json({ success: true, data: link });
   } catch (error) {
     console.error('Error updating social media link:', error);
-    if (req.file) {
-      fs.unlinkSync(req.file.path);
-    }
     res.status(500).json({ error: error.message });
   }
 });
 
-// DELETE social media link (UPDATED with image cleanup)
+// DELETE social media link
 app.delete('/api/social-media-links/:id', async (req, res) => {
   try {
     const { id } = req.params;
 
-    // Check if link exists and get image path
     const [existing] = await pool.query(
-      'SELECT id, author_image FROM social_media_links WHERE id = ?', 
+      'SELECT id FROM social_media_links WHERE id = ?', 
       [id]
     );
     
     if (existing.length === 0) {
       return res.status(404).json({ error: 'Social media link not found' });
-    }
-
-    // Delete associated image if exists
-    if (existing[0].author_image) {
-      const imagePath = path.join('uploads/social-media', existing[0].author_image);
-      if (fs.existsSync(imagePath)) {
-        fs.unlinkSync(imagePath);
-      }
     }
 
     await pool.query('DELETE FROM social_media_links WHERE id = ?', [id]);
@@ -1611,101 +1931,6 @@ app.delete('/api/social-media-links/:id', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
-
-// GET social media links by author name (updated)
-app.get('/api/social-media-links/author/:name', async (req, res) => {
-  try {
-    const { name } = req.params;
-    const [rows] = await pool.query(
-      `SELECT 
-        id,
-        author_name as authorName,
-        author_email as authorEmail,
-        author_image as authorImage,
-        platform,
-        username,
-        url,
-        description,
-        is_active as isActive,
-        created_at as createdAt
-      FROM social_media_links 
-      WHERE author_name LIKE ? AND is_active = TRUE
-      ORDER BY platform`,
-      [`%${name}%`]
-    );
-    
-    // Transform the data to include full URL for images
-    const transformedRows = rows.map(row => ({
-      ...row,
-      authorImage: row.authorImage ? `/uploads/social-media/${row.authorImage}` : null
-    }));
-    
-    res.json(transformedRows);
-  } catch (error) {
-    console.error('Error fetching social media links by author:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// GET social media links by platform (updated)
-app.get('/api/social-media-links/platform/:platform', async (req, res) => {
-  try {
-    const { platform } = req.params;
-    const [rows] = await pool.query(
-      `SELECT 
-        id,
-        author_name as authorName,
-        author_email as authorEmail,
-        author_image as authorImage,
-        platform,
-        username,
-        url,
-        description,
-        is_active as isActive,
-        created_at as createdAt
-      FROM social_media_links 
-      WHERE platform = ? AND is_active = TRUE
-      ORDER BY author_name`,
-      [platform]
-    );
-    
-    // Transform the data to include full URL for images
-    const transformedRows = rows.map(row => ({
-      ...row,
-      authorImage: row.authorImage ? `/uploads/social-media/${row.authorImage}` : null
-    }));
-    
-    res.json(transformedRows);
-  } catch (error) {
-    console.error('Error fetching social media links by platform:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// PATCH update link status (active/inactive)
-app.patch('/api/social-media-links/:id/status', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { isActive } = req.body;
-
-    if (typeof isActive !== 'boolean') {
-      return res.status(400).json({ error: 'isActive must be a boolean value' });
-    }
-
-    await pool.query(
-      'UPDATE social_media_links SET is_active = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-      [isActive, id]
-    );
-
-    res.json({ success: true, message: `Link ${isActive ? 'activated' : 'deactivated'} successfully` });
-  } catch (error) {
-    console.error('Error updating link status:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Add static file serving for social media uploads
-app.use('/uploads/social-media', express.static('uploads/social-media'));
 
 
 // ========== EVENT ROUTES WITH BASE64 STORAGE ==========
