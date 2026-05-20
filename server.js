@@ -56,7 +56,7 @@ const corsOptions = {
     if (!origin && isDevelopment) return callback(null, true);
     
     const allowedOrigins = [
-      'http://192.168.68.12:5177', // Your LAN IP for development
+      'http://192.168.68.54:5177', // Your LAN IP for development
       'http://localhost:5177',     // Localhost for development
       'http://localhost:5173',     // Additional local port
       'http://127.0.0.1:5177',     // Localhost IP
@@ -4215,7 +4215,161 @@ app.get('/api/agent/profile/public/:id', async (req, res) => {
 
 
 
+const crypto = require('crypto');
+const nodemailer = require('nodemailer');
 
+const transporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: process.env.SMTP_PORT,
+    secure: true,
+    auth: {
+        user: process.env.EMAIL_USER,
+        pass: process.env.EMAIL_PASS
+    }
+});
+
+app.post('/api/auth/forgot-password', async (req, res) => {
+    try {
+        const { email } = req.body;
+
+        if (!email) {
+            return res.status(400).json({
+                success: false,
+                error: 'Email is required'
+            });
+        }
+
+        // Check user
+        const [users] = await pool.query(
+            'SELECT id, email FROM agents WHERE email = ?',
+            [email]
+        );
+
+        // Always return success (security reason)
+        if (users.length === 0) {
+            return res.json({
+                success: true,
+                message: 'If the email exists, a reset link has been sent.'
+            });
+        }
+
+        const user = users[0];
+
+        // Generate token
+        const token = crypto.randomBytes(32).toString('hex');
+
+        // Expiry (1 hour)
+        const expiry = new Date(Date.now() + 60 * 60 * 1000);
+
+        // Save token in DB
+        await pool.query(
+            `UPDATE agents 
+             SET reset_token = ?, reset_token_expiry = ?
+             WHERE id = ?`,
+            [token, expiry, user.id]
+        );
+
+        const resetLink = `${process.env.FRONTEND_URL}/reset-password/${token}`;
+
+        console.log('RESET LINK:', resetLink);
+
+        // SEND EMAIL WITH ERROR HANDLING
+        try {
+            await transporter.sendMail({
+                from: `"${process.env.EMAIL_FROM_NAME}" <${process.env.EMAIL_FROM_ADDRESS}>`,
+                to: email,
+                subject: 'Reset Your Password',
+                html: `
+                    <div style="font-family: Arial">
+                        <h2>Password Reset Request</h2>
+                        <p>You requested to reset your password.</p>
+
+                        <p>
+                            <a href="${resetLink}" 
+                               style="padding:10px 15px;background:#4f46e5;color:white;text-decoration:none;border-radius:5px;">
+                               Reset Password
+                            </a>
+                        </p>
+
+                        <p>This link will expire in 1 hour.</p>
+
+                        <p>If you did not request this, ignore this email.</p>
+                    </div>
+                `
+            });
+
+            console.log('EMAIL SENT SUCCESSFULLY TO:', email);
+
+        } catch (mailError) {
+            console.error('EMAIL SENDING FAILED:', mailError);
+
+            return res.status(500).json({
+                success: false,
+                error: 'Failed to send email. Check SMTP configuration.'
+            });
+        }
+
+        return res.json({
+            success: true,
+            message: 'Reset link sent to email.'
+        });
+
+    } catch (error) {
+        console.error('FORGOT PASSWORD ERROR:', error);
+
+        return res.status(500).json({
+            success: false,
+            error: 'Server error'
+        });
+    }
+});
+
+
+app.post('/api/auth/reset-password/:token', async (req, res) => {
+    try {
+        const { token } = req.params;
+        const { password } = req.body;
+
+        const [users] = await pool.query(
+            `SELECT id 
+             FROM agents 
+             WHERE reset_token = ?
+             AND reset_token_expiry > NOW()`,
+            [token]
+        );
+
+        if (users.length === 0) {
+            return res.status(400).json({
+                success: false,
+                error: 'Invalid or expired token'
+            });
+        }
+
+        const hashedPassword = await bcrypt.hash(password, 10);
+
+        await pool.query(
+            `UPDATE agents
+             SET password_hash = ?,
+                 reset_token = NULL,
+                 reset_token_expiry = NULL
+             WHERE id = ?`,
+            [hashedPassword, users[0].id]
+        );
+
+        res.json({
+            success: true,
+            message: 'Password reset successful'
+        });
+
+    } catch (error) {
+        console.error(error);
+
+        res.status(500).json({
+            success: false,
+            error: 'Server error'
+        });
+    }
+});
 
 
 
